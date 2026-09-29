@@ -1,0 +1,68 @@
+# Ablation study plan (Thesis C).
+#
+# Every variant = the reference model (base_config) + the listed overrides.
+# Each variant is trained and tested once per seed, writing to its own setting
+# `abl_<variant>_s<seed>` -- CLI overrides beat the YAML (run.py::resolve_args),
+# so these are real ablations with separate checkpoint/result directories.
+#
+#   python run_ablations.py --plan configs/ablations.yaml                 # everything
+#   python run_ablations.py --plan configs/ablations.yaml --groups modality,prognostic_layer
+#   python run_ablations.py --plan configs/ablations.yaml --dry_run       # print commands only
+#   python collect_results.py --plan configs/ablations.yaml               # summary tables
+#
+# One-factor-at-a-time design: each group changes ONE component relative to
+# `reference`, so a difference in C-index is attributable to that component.
+
+base_config: configs/ckd_prognosis.yaml
+reference: full
+seeds: [41, 42, 43]
+
+# metrics reported in the summary tables (keys of test_metrics.json)
+report_metrics: [c_index, td_auroc_365d, td_auroc_730d, brier_ipcw_730d, ece_730d, hr_high_vs_low]
+primary_metric: c_index
+
+variants:
+  # ---- reference: multimodal, gated fusion, discrete-time survival risk layer
+  full: {}
+
+  # ---- A. modality contribution
+  ecg_only: {use_ehr: false}
+  ehr_only: {use_ecg: false}
+
+  # ---- B. fusion strategy
+  fusion_concat: {fusion: concat}
+  fusion_cross_patches: {fusion: cross, cross_attn_tokens: patches}
+  fusion_cross_granularity: {fusion: cross, cross_attn_tokens: granularity}
+
+  # ---- C. prognostic layer: risk prediction vs binary classification
+  head_cox: {head: cox, batch_size: 64}          # Cox partial likelihood needs events in the batch
+  head_binary: {head: binary}                    # the Thesis B-style classifier, for comparison
+
+  # ---- D. Cardioformer backbone components (ECG encoder)
+  single_granularity: {patch_len_list: "16"}
+  no_inter_granularity: {inter_granularity: false}
+  channel_independent: {cross_channel: false}
+  linear_patch_embedding: {patch_encoder: linear}
+
+  # ---- E. EHR feature groups (does the ECG add information beyond renal labs?)
+  no_renal_labs: {ehr_drop_groups: renal}
+  no_other_labs: {ehr_drop_groups: labs_other}
+  no_comorbidities: {ehr_drop_groups: comorbidities}
+  ecg_plus_demographics: {ehr_drop_groups: "renal,labs_other,comorbidities"}
+
+  # ---- F. training
+  no_augmentation: {augment: false}
+
+  # ---- G. classical (non-deep) baseline on the same EHR features and splits
+  # A linear Cox proportional-hazards model: identity EHR encoder + linear Cox head.
+  # It has far fewer parameters, so it is given its own (larger) LR and batch.
+  linear_cox_ehr: {use_ecg: false, ehr_mode: identity, head: cox, head_hidden: 0,
+                   learning_rate: 0.001, batch_size: 256}
+
+groups:
+  modality: [full, ecg_only, ehr_only, linear_cox_ehr]
+  fusion: [full, fusion_concat, fusion_cross_patches, fusion_cross_granularity]
+  prognostic_layer: [full, head_cox, head_binary]
+  ecg_backbone: [full, single_granularity, no_inter_granularity, channel_independent, linear_patch_embedding]
+  ehr_features: [full, no_renal_labs, no_other_labs, no_comorbidities, ecg_plus_demographics, ecg_only]
+  training: [full, no_augmentation]

@@ -1,0 +1,66 @@
+# Default configuration for CardioformerCKD.
+# Precedence: explicit CLI flag > this file > argparse default.
+# (run.py::resolve_args only fills in keys you did NOT pass on the command line,
+#  so e.g. `--config configs/default.yaml --use_ehr 0` really does ablate EHR.)
+
+task_name: ckd_prognosis
+model: CardioformerCKD
+setting: ckd_default
+
+# data
+root_path: dataset/ckd
+data: MIMICIV_CKD
+seq_len: 250        # ECG window length (250 timestamps = 1 s at 250 Hz)
+enc_in: 12          # 12-lead ECG
+num_workers: 4
+augment: true
+
+# Cardioformer backbone
+d_model: 128
+n_heads: 8
+e_layers: 6
+d_ff: 256
+dropout: 0.1
+patch_len_list: "2,4,8,8,16,16,16,16,32"
+resnet_hidden: 64
+resnet_blocks: 2
+cross_channel: true
+patch_encoder: resnet     # resnet | linear (ablation)
+inter_granularity: true   # false = ablation
+
+# multimodal / prognostic
+use_ecg: true
+use_ehr: true
+ehr_mode: mlp
+ehr_dropout: 0.2
+fusion: gated       # concat | gated | cross
+cross_attn_tokens: patches   # patches | granularity (cross fusion only)
+d_fuse: 256
+head: survival      # survival | cox | binary (binary = ablation baseline only)
+head_hidden: 128    # 0 = linear head
+n_intervals: 8
+horizon_days: 730
+eval_horizons_days: "365,730"
+risk_strat_method: quantile
+risk_strat_quantiles: "0.5"
+n_bootstrap: 200
+
+# optimisation
+batch_size: 16
+learning_rate: 0.0001
+weight_decay: 0.0001
+train_epochs: 20
+patience: 5
+lradj: cosine       # cosine | step | type1 (legacy: halves LR every epoch) | none
+lr_decay_every: 5   # lradj=step only
+lr_decay_rate: 0.5  # lradj=step only
+min_lr: 0.000001
+focal_alpha: 0.25
+focal_gamma: 2.0
+seed: 41
+
+# system
+use_gpu: true
+gpu: 0
+checkpoints: checkpoints/ckd_prognosis
+results: results/ckd_prognosis

@@ -1,0 +1,3151 @@
+diff --git a/README.md b/README.md
+index f99a0b8..756b973 100644
+--- a/README.md
++++ b/README.md
+@@ -1,10 +1,71 @@
+-# Cardioformer-CKD: Prognostic Chronic Kidney Disease Prediction
++# Cardioformer-CKD: Multimodal Risk Prediction for Incident Chronic Kidney Disease
+ 
+-Multimodal **prognostic** deep-learning model that predicts whether a patient
+-will develop **incident chronic kidney disease (CKD)** within a future horizon,
+-by combining the **MIMIC-IV** electronic health record (EHR) with the
++Multimodal **prognostic risk-prediction** model that estimates each patient's
++**risk of developing incident chronic kidney disease (CKD)** over a future
++horizon (1 and 2 years), and stratifies patients into **low- and high-risk
++groups**, by combining the **MIMIC-IV** electronic health record (EHR) with the
+ **MIMIC-IV-ECG** 12-lead waveform dataset.
+ 
++> **Thesis C update.** The prognostic layer now does *risk prediction*, not
++> binary classification; risk stratification and a full ablation study were
++> added. See **`THESIS_C_CHANGES.md`** for what changed and why, and
++> `PATCHES.md` for the Thesis B correctness fixes.
++
++## Quick start
++
++```bash
++# 0. check the whole pipeline without MIMIC (synthetic data, results meaningless)
++python scripts/make_synthetic_dataset.py --out_dir dataset/synthetic
++python run.py --config configs/ckd_prognosis.yaml --root_path dataset/synthetic \
++  --setting synthetic_check --train_epochs 2 --use_gpu 0 --num_workers 0
++
++# 1. real data
++bash scripts/preprocess_all.sh                     # MIMIC-IV + MIMIC-IV-ECG -> dataset/ckd
++python run.py --config configs/ckd_prognosis.yaml  # train + test the reference model
++python scripts/plot_results.py --run results/ckd_prognosis/ckd_2y_survival_multimodal
++
++# 2. ablation study
++python run_ablations.py --plan configs/ablations.yaml
++python collect_results.py --plan configs/ablations.yaml
++```
++
++## What the model outputs (per patient)
++
++| output | meaning |
++|---|---|
++| `risk_score` | continuous ranking score, higher = CKD expected sooner |
++| `abs_risk_365d`, `abs_risk_730d` | predicted probability of incident CKD within 1 y / 2 y |
++| `risk_group` | `low` / `high` (or `low` / `intermediate` / `high`), cut-points fitted on validation |
++
++Written to `results/<...>/<setting>/test_predictions.csv`, with
++`risk_groups.json` (observed Kaplan-Meier risk per group, log-rank p, HR high vs
++low), `km_curves.csv`, `calibration.csv` and `test_metrics.json`.
++
++## Prognostic risk layer (`--head`)
++
++| head | trained with | risk curve | role |
++|---|---|---|---|
++| `survival` (default) | discrete-time survival NLL | CIF at every bin | main model |
++| `cox` | Cox partial likelihood | Breslow baseline x exp(eta) | alternative risk layer |
++| `binary` | focal BCE on horizon-eligible patients | horizon only | **ablation baseline only** |
++
++## Risk stratification (`--risk_strat_method`)
++
++`quantile` (default `--risk_strat_quantiles 0.5`: median split into low / high;
++`0.33,0.67` for tertiles), `absolute` (`--risk_strat_cutoffs 0.05,0.15` on
++predicted 2-year risk), `youden`, or `sensitivity` (`--risk_strat_target_sens`).
++Cut-points are **always fitted on the validation split** and frozen before the
++test split is touched.
++
++## Ablation study
++
++`configs/ablations.yaml` defines one-factor-at-a-time variants relative to the
++reference model, grouped as: modality, fusion, prognostic layer, ECG backbone
++components (multi-granularity, inter-granularity attention, cross-channel
++patching, ResNet patch encoder), EHR feature groups, training, and a classical
++linear Cox baseline. Each variant runs for 3 seeds; `collect_results.py` writes
++mean ± std and the paired Δ vs the reference as CSV / Markdown / LaTeX.
++
+ ## Provenance of the ECG backbone (important for the thesis)
+ 
+ `models/Cardioformer.py`, `layers/Embed.py` and `layers/Cardioformer_EncDec.py`
+@@ -58,10 +119,12 @@ initialised weights.
+ 
+ | metric | computed over |
+ |---|---|
+-| `c_index` | all patients (right-censoring handled by the comparable-pair definition) |
+-| `td_auroc` | **eligible patients only** — event by the horizon, or follow-up reaching it |
+-| `brier_at_horizon` | eligible patients only |
+-| `n_eligible` / `n_total` | how many patients the horizon metrics were computed on |
++| `c_index` | all patients, follow-up truncated at the horizon (Harrell); `c_index_untruncated` for comparison with Thesis B |
++| `td_auroc_<h>d` | **eligible patients only** — event by h, or follow-up reaching h |
++| `brier_ipcw_<h>d` | all patients, inverse-probability-of-censoring weighted (Graf et al.) |
++| `ece_730d` | expected calibration error over risk deciles (KM-observed vs predicted) |
++| `*_ci95` | subject-level bootstrap 95% CI (`--n_bootstrap`) |
++| `hr_high_vs_low`, `logrank_p` | separation of the risk groups on the test set |
+ 
+ Patients censored *before* the horizon have an unknown horizon label; scoring
+ them as negatives inflates `td_auroc` (see `tests/test_metrics.py`).
+diff --git a/THESIS_C_CHANGES.md b/THESIS_C_CHANGES.md
+new file mode 100644
+index 0000000..fec0d94
+--- /dev/null
++++ b/THESIS_C_CHANGES.md
+@@ -0,0 +1,104 @@
++# Thesis C changes
++
++Supervisor feedback at the start of Thesis C:
++
++1. update the prognostic layer to do **risk prediction, not binary classification**;
++2. **identify high-risk and low-risk patients**;
++3. implement **ablation studies**.
++
++This file records what changed in the code for each point, plus one labelling
++bug found along the way. Test status: **57 tests pass** (`pytest tests -q`),
++including an end-to-end train → test → reload run on synthetic data and
++cross-checks of the survival statistics against `lifelines`.
++
++---
++
++## 0. Bug fix: CKD onsets after the horizon were counted as in-horizon events
++
++**Files:** `data_provider/data_loader.py`, `exp/exp_ckd_prognosis.py`, `utils/survival.py`
++
++`build_cohort.py` sets `event_indicator = 1` for a CKD onset at *any* time after
++t0 and caps `event_bin` at the last interval. The survival loss therefore
++treated an onset at year 5 as an event in the 1.75–2 y bin, inflating the
++predicted late hazard. The dataset now applies **administrative censoring at the
++horizon** (`event_indicator_h`, `event_time_h`); every risk head trains on these.
++No cohort rebuild is needed. The C-index is now computed on horizon-truncated
++follow-up (`c_index`); the previous definition is kept as `c_index_untruncated`.
++
++**Action required:** survival-head results from Thesis B should be re-run.
++
++## 1. Prognostic layer → risk prediction
++
++**Files:** `models/heads.py`, `models/CardioformerCKD.py`, `utils/losses.py`, `exp/exp_ckd_prognosis.py`, `run.py`
++
++* Every head now produces a **continuous risk score** and an **absolute risk**
++  (probability of incident CKD) at each horizon in `--eval_horizons_days`
++  (default 1 y and 2 y).
++* `--head survival` (default): discrete-time hazards → cumulative incidence curve.
++* `--head cox` (new): DeepSurv-style log-risk trained with the Cox partial
++  likelihood (Breslow ties, verified against a hand-computed likelihood and
++  against lifelines). Absolute risk comes from a Breslow baseline hazard fitted on
++  the training split after training (`baseline_hazard.json`), verified against
++  lifelines to 1e-16.
++* `--head binary` is kept **only as an ablation baseline**.
++* `--head_hidden 0` makes the head linear; `--ehr_mode identity` feeds raw
++  standardised EHR features. Together with `--use_ecg 0 --head cox` this is a
++  classical **linear Cox PH baseline** trained on identical splits.
++* New evaluation: time-dependent AUROC per horizon, **IPCW Brier score**
++  (Graf et al.), **calibration by deciles + ECE**, and **subject-level bootstrap
++  95% CIs** (`--n_bootstrap`).
++
++## 2. High-risk / low-risk patients
++
++**Files:** `utils/risk_stratification.py`, `utils/survival.py`, `exp/exp_ckd_prognosis.py`, `scripts/plot_results.py`
++
++* Cut-points are fitted on the **validation** split only, then applied to test.
++* Methods: `quantile` (default median split → low/high; `0.33,0.67` → tertiles),
++  `absolute` (fixed predicted-risk cut-offs), `youden`, `sensitivity`.
++* Per group: n, observed Kaplan–Meier CKD incidence at the horizon with 95% CI,
++  mean predicted risk. Between groups: log-rank test and hazard ratio (high vs low).
++* Outputs: `test_predictions.csv` (per-patient risk and group),
++  `risk_groups.json`, `km_curves.csv`, `calibration.csv`; figures from
++  `scripts/plot_results.py` (KM curves by risk group, calibration plot, risk
++  distribution).
++* Re-stratify a trained model without retraining: `--is_training 0 --risk_strat_...`.
++
++## 3. Ablation studies
++
++**Files:** `configs/ablations.yaml`, `run_ablations.py`, `collect_results.py`, `layers/Embed.py`, `layers/Cardioformer_EncDec.py`, `models/Cardioformer.py`, `data_provider/data_loader.py`
++
++One-factor-at-a-time variants vs the reference model, each over 3 seeds:
++
++| group | variants |
++|---|---|
++| modality | ECG+EHR, ECG only, EHR only, linear Cox (EHR) |
++| fusion | gated, concat, cross-attention over patches, over granularities |
++| prognostic layer | survival, Cox, binary |
++| ECG backbone | single granularity, no inter-granularity attention, channel-independent patching, linear patch embedding |
++| EHR features | − renal labs, − other labs, − comorbidities, ECG + demographics, ECG only |
++| training | no augmentation |
++
++New switches: `--patch_encoder resnet|linear`, `--inter_granularity 0/1`,
++`--ehr_drop_groups`. Defaults reproduce the Thesis B architecture exactly (state-dict keys
++unchanged, so old checkpoints still load).
++
++`collect_results.py` writes mean ± std over seeds and the **paired Δ vs the reference**
++(seed by seed) as CSV, Markdown and LaTeX tables. `scripts/plot_results.py --ablation`
++draws the Δ C-index chart.
++
++## 4. Tooling
++
++* `scripts/make_synthetic_dataset.py`: small synthetic dataset with the real schema,
++  so the whole pipeline can be checked without MIMIC access. **Never report its numbers.**
++* `tests/test_risk_layer.py`, `tests/test_ablation_and_e2e.py`: 24 new tests.
++* Notebook sections 7–10 updated for stratification, ablations and per-patient risk.
++
++## Behavioural changes
++
++| change | effect |
++|---|---|
++| horizon censoring | survival-head numbers from Thesis B are not comparable; re-run |
++| `c_index` now horizon-truncated | use `c_index_untruncated` to compare with Thesis B logs |
++| `brier_at_horizon` now IPCW-weighted over all patients | differs from Thesis B's unweighted eligible-only value |
++| early stopping on `--early_stop_metric` (default C-index) for every head | binary head previously early-stopped on AUROC |
++| `test()` writes predictions / groups / curves | extra files in each results dir |
+diff --git a/collect_results.py b/collect_results.py
+new file mode 100644
+index 0000000..9c7aa3a
+--- /dev/null
++++ b/collect_results.py
+@@ -0,0 +1,151 @@
++"""Aggregate ablation results into thesis-ready tables.
++
++Reads ``<results>/abl_<variant>_s<seed>/test_metrics.json`` for every variant
++and seed in the plan and writes, next to them:
++
++    ablation_runs.csv       one row per (variant, seed)
++    ablation_summary.csv    mean, std over seeds, and paired delta vs reference
++    ablation_summary.md     one Markdown table per ablation group
++    ablation_summary.tex    the same as LaTeX booktabs tables
++
++The paired delta is computed seed-by-seed (variant_s - reference_s), so seed
++noise shared by both runs cancels; its std shows whether a difference is larger
++than run-to-run variation.
++
++    python collect_results.py --plan configs/ablations.yaml [-- --results results/ckd_prognosis]
++"""
++
++import argparse
++import csv
++import json
++import os
++import sys
++
++import numpy as np
++
++from run_ablations import load_plan, results_dir_for, build_argv
++
++PRETTY = {
++    "c_index": "C-index", "td_auroc_365d": "AUROC@1y", "td_auroc_730d": "AUROC@2y",
++    "brier_ipcw_730d": "Brier@2y", "brier_ipcw_365d": "Brier@1y", "ece_730d": "ECE@2y",
++    "hr_high_vs_low": "HR high/low",
++}
++LOWER_IS_BETTER = {"brier_ipcw_730d", "brier_ipcw_365d", "ece_730d"}
++
++
++def _fmt(mean, std, n):
++    if mean is None or not np.isfinite(mean):
++        return "--"
++    return f"{mean:.3f} ± {std:.3f}" if n > 1 and np.isfinite(std) else f"{mean:.3f}"
++
++
++def _fmt_delta(d, sd, n):
++    if d is None or not np.isfinite(d):
++        return "--"
++    s = f"{d:+.3f}"
++    return f"{s} ± {sd:.3f}" if n > 1 and np.isfinite(sd) else s
++
++
++def collect(plan_path, forwarded=()):
++    plan = load_plan(plan_path)
++    metrics = plan.get("report_metrics", ["c_index"])
++    ref = plan["reference"]
++    runs = {}
++    rows = []
++    res_root = None
++    for v in plan["variants"]:
++        for s in plan["seeds"]:
++            out = results_dir_for(build_argv(plan, v, s, forwarded))
++            res_root = res_root or os.path.dirname(out)
++            f = os.path.join(out, "test_metrics.json")
++            if not os.path.exists(f):
++                continue
++            m = json.load(open(f))
++            runs[(v, s)] = m
++            rows.append(dict({"variant": v, "seed": s},
++                             **{k: m.get(k, float("nan")) for k in metrics}))
++
++    summary = []
++    for v in plan["variants"]:
++        seeds_v = [s for s in plan["seeds"] if (v, s) in runs]
++        if not seeds_v:
++            continue
++        r = {"variant": v, "n_seeds": len(seeds_v)}
++        for k in metrics:
++            vals = np.array([float(runs[(v, s)].get(k, np.nan)) for s in seeds_v])
++            vals = vals[np.isfinite(vals)]
++            r[f"{k}_mean"] = float(vals.mean()) if vals.size else float("nan")
++            r[f"{k}_std"] = float(vals.std(ddof=1)) if vals.size > 1 else float("nan")
++            paired = [float(runs[(v, s)].get(k, np.nan)) - float(runs[(ref, s)].get(k, np.nan))
++                      for s in seeds_v if (ref, s) in runs]
++            paired = np.array([d for d in paired if np.isfinite(d)])
++            r[f"{k}_delta"] = float(paired.mean()) if paired.size else float("nan")
++            r[f"{k}_delta_std"] = float(paired.std(ddof=1)) if paired.size > 1 else float("nan")
++        summary.append(r)
++    return plan, rows, summary, res_root
++
++
++def write_tables(plan, rows, summary, out_dir):
++    os.makedirs(out_dir, exist_ok=True)
++    metrics = plan.get("report_metrics", ["c_index"])
++    primary = plan.get("primary_metric", metrics[0])
++    by_v = {r["variant"]: r for r in summary}
++
++    for name, data in (("ablation_runs.csv", rows), ("ablation_summary.csv", summary)):
++        if data:
++            with open(os.path.join(out_dir, name), "w", newline="") as f:
++                w = csv.DictWriter(f, fieldnames=list(data[0].keys()))
++                w.writeheader()
++                w.writerows(data)
++
++    md, tex = ["# Ablation study results", "",
++               f"Mean ± std over seeds {plan['seeds']}. Δ = paired difference vs "
++               f"`{plan['reference']}` on the primary metric ({PRETTY.get(primary, primary)}).", ""], []
++    for g, vs in plan["groups"].items():
++        head = ["Variant", "n"] + [PRETTY.get(k, k) for k in metrics] + [f"Δ {PRETTY.get(primary, primary)}"]
++        md += [f"## {g}", "", "| " + " | ".join(head) + " |",
++               "|" + "|".join(["---"] * len(head)) + "|"]
++        tex += [f"% ---- {g}", "\\begin{table}[h]\\centering\\small",
++                "\\begin{tabular}{l" + "c" * (len(head) - 1) + "}", "\\toprule",
++                " & ".join(head).replace("±", "$\\pm$").replace("Δ", "$\\Delta$") + " \\\\", "\\midrule"]
++        for v in vs:
++            r = by_v.get(v)
++            if r is None:
++                cells = [v, "0"] + ["--"] * (len(metrics) + 1)
++            else:
++                n = r["n_seeds"]
++                cells = [v, str(n)] + [_fmt(r[f"{k}_mean"], r[f"{k}_std"], n) for k in metrics]
++                cells.append("ref" if v == plan["reference"]
++                             else _fmt_delta(r[f"{primary}_delta"], r[f"{primary}_delta_std"], n))
++            md.append("| " + " | ".join(cells) + " |")
++            tex.append(" & ".join(c.replace("_", "\\_").replace("±", "$\\pm$") for c in cells) + " \\\\")
++        md.append("")
++        tex += ["\\bottomrule", "\\end{tabular}",
++                f"\\caption{{Ablation: {g.replace('_', ' ')}.}}", "\\end{table}", ""]
++    open(os.path.join(out_dir, "ablation_summary.md"), "w").write("\n".join(md))
++    open(os.path.join(out_dir, "ablation_summary.tex"), "w").write("\n".join(tex))
++    return os.path.join(out_dir, "ablation_summary.md")
++
++
++def main(argv=None):
++    p = argparse.ArgumentParser(description="Collect ablation results")
++    p.add_argument("--plan", default="configs/ablations.yaml")
++    p.add_argument("--out_dir", default=None, help="default: the results root")
++    argv = list(sys.argv[1:] if argv is None else argv)
++    forwarded = []
++    if "--" in argv:
++        i = argv.index("--")
++        argv, forwarded = argv[:i], argv[i + 1:]
++    args, unknown = p.parse_known_args(argv)
++    plan, rows, summary, res_root = collect(args.plan, unknown + forwarded)
++    if not rows:
++        print("[collect] no finished runs found")
++        return 1
++    path = write_tables(plan, rows, summary, args.out_dir or res_root)
++    print(open(path).read())
++    print(f"[collect] {len(rows)} runs -> {os.path.dirname(path)}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/configs/ablations.yaml b/configs/ablations.yaml
+new file mode 100644
+index 0000000..11e1843
+--- /dev/null
++++ b/configs/ablations.yaml
+@@ -0,0 +1,68 @@
++# Ablation study plan (Thesis C).
++#
++# Every variant = the reference model (base_config) + the listed overrides.
++# Each variant is trained and tested once per seed, writing to its own setting
++# `abl_<variant>_s<seed>` -- CLI overrides beat the YAML (run.py::resolve_args),
++# so these are real ablations with separate checkpoint/result directories.
++#
++#   python run_ablations.py --plan configs/ablations.yaml                 # everything
++#   python run_ablations.py --plan configs/ablations.yaml --groups modality,prognostic_layer
++#   python run_ablations.py --plan configs/ablations.yaml --dry_run       # print commands only
++#   python collect_results.py --plan configs/ablations.yaml               # summary tables
++#
++# One-factor-at-a-time design: each group changes ONE component relative to
++# `reference`, so a difference in C-index is attributable to that component.
++
++base_config: configs/ckd_prognosis.yaml
++reference: full
++seeds: [41, 42, 43]
++
++# metrics reported in the summary tables (keys of test_metrics.json)
++report_metrics: [c_index, td_auroc_365d, td_auroc_730d, brier_ipcw_730d, ece_730d, hr_high_vs_low]
++primary_metric: c_index
++
++variants:
++  # ---- reference: multimodal, gated fusion, discrete-time survival risk layer
++  full: {}
++
++  # ---- A. modality contribution
++  ecg_only: {use_ehr: false}
++  ehr_only: {use_ecg: false}
++
++  # ---- B. fusion strategy
++  fusion_concat: {fusion: concat}
++  fusion_cross_patches: {fusion: cross, cross_attn_tokens: patches}
++  fusion_cross_granularity: {fusion: cross, cross_attn_tokens: granularity}
++
++  # ---- C. prognostic layer: risk prediction vs binary classification
++  head_cox: {head: cox, batch_size: 64}          # Cox partial likelihood needs events in the batch
++  head_binary: {head: binary}                    # the Thesis B-style classifier, for comparison
++
++  # ---- D. Cardioformer backbone components (ECG encoder)
++  single_granularity: {patch_len_list: "16"}
++  no_inter_granularity: {inter_granularity: false}
++  channel_independent: {cross_channel: false}
++  linear_patch_embedding: {patch_encoder: linear}
++
++  # ---- E. EHR feature groups (does the ECG add information beyond renal labs?)
++  no_renal_labs: {ehr_drop_groups: renal}
++  no_other_labs: {ehr_drop_groups: labs_other}
++  no_comorbidities: {ehr_drop_groups: comorbidities}
++  ecg_plus_demographics: {ehr_drop_groups: "renal,labs_other,comorbidities"}
++
++  # ---- F. training
++  no_augmentation: {augment: false}
++
++  # ---- G. classical (non-deep) baseline on the same EHR features and splits
++  # A linear Cox proportional-hazards model: identity EHR encoder + linear Cox head.
++  # It has far fewer parameters, so it is given its own (larger) LR and batch.
++  linear_cox_ehr: {use_ecg: false, ehr_mode: identity, head: cox, head_hidden: 0,
++                   learning_rate: 0.001, batch_size: 256}
++
++groups:
++  modality: [full, ecg_only, ehr_only, linear_cox_ehr]
++  fusion: [full, fusion_concat, fusion_cross_patches, fusion_cross_granularity]
++  prognostic_layer: [full, head_cox, head_binary]
++  ecg_backbone: [full, single_granularity, no_inter_granularity, channel_independent, linear_patch_embedding]
++  ehr_features: [full, no_renal_labs, no_other_labs, no_comorbidities, ecg_plus_demographics, ecg_only]
++  training: [full, no_augmentation]
+diff --git a/configs/ckd_prognosis.yaml b/configs/ckd_prognosis.yaml
+index 51b1ec2..11ab32c 100644
+--- a/configs/ckd_prognosis.yaml
++++ b/configs/ckd_prognosis.yaml
+@@ -1,4 +1,4 @@
+-# Experiment: 2-year incident-CKD prognosis, multimodal, discrete-time survival.
++# Experiment: 2-year incident-CKD RISK PREDICTION, multimodal, discrete-time survival.
+ # Cohort built with: horizon_days=730, blank_days=30, n_intervals=8.
+ 
+ task_name: ckd_prognosis
+@@ -21,8 +21,22 @@ use_ehr: true
+ ehr_mode: mlp
+ fusion: gated
+ cross_attn_tokens: patches
+-head: survival
++
++# prognostic risk layer (Thesis C) -- risk prediction, not binary classification
++head: survival              # survival | cox | binary (binary = ablation baseline only)
++head_hidden: 128
+ n_intervals: 8
++horizon_days: 730           # must match build_cohort --horizon_days
++eval_horizons_days: "365,730"
++
++# risk stratification: cut-points fitted on validation, applied to test
++risk_strat_method: quantile # quantile | absolute | youden | sensitivity
++risk_strat_quantiles: "0.5" # median split -> low / high risk
++risk_strat_cutoffs: "0.05,0.15"
++
++# evaluation
++n_bootstrap: 200
++early_stop_metric: c_index
+ 
+ batch_size: 16
+ learning_rate: 0.0001
+diff --git a/configs/default.yaml b/configs/default.yaml
+index f66c12f..0817461 100644
+--- a/configs/default.yaml
++++ b/configs/default.yaml
+@@ -25,6 +25,8 @@ patch_len_list: "2,4,8,8,16,16,16,16,32"
+ resnet_hidden: 64
+ resnet_blocks: 2
+ cross_channel: true
++patch_encoder: resnet     # resnet | linear (ablation)
++inter_granularity: true   # false = ablation
+ 
+ # multimodal / prognostic
+ use_ecg: true
+@@ -34,8 +36,14 @@ ehr_dropout: 0.2
+ fusion: gated       # concat | gated | cross
+ cross_attn_tokens: patches   # patches | granularity (cross fusion only)
+ d_fuse: 256
+-head: survival      # binary | survival
++head: survival      # survival | cox | binary (binary = ablation baseline only)
++head_hidden: 128    # 0 = linear head
+ n_intervals: 8
++horizon_days: 730
++eval_horizons_days: "365,730"
++risk_strat_method: quantile
++risk_strat_quantiles: "0.5"
++n_bootstrap: 200
+ 
+ # optimisation
+ batch_size: 16
+diff --git a/data_provider/data_factory.py b/data_provider/data_factory.py
+index de433ce..9dc57be 100644
+--- a/data_provider/data_factory.py
++++ b/data_provider/data_factory.py
+@@ -13,10 +13,12 @@ data_dict = {
+ }
+ 
+ 
+-def data_provider(args, flag, scaler=None, ehr_columns=None):
++def data_provider(args, flag, scaler=None, ehr_columns=None, deterministic=False):
++    """``deterministic=True``: no shuffle / drop_last / random crop / augmentation,
++    even for the train split (used to score the training set, e.g. the Breslow fit)."""
+     Data = data_dict[args.data]
+-    shuffle = flag == "train"
+-    drop_last = flag == "train"
++    shuffle = flag == "train" and not deterministic
++    drop_last = flag == "train" and not deterministic
+ 
+     dataset = Data(
+         root_path=args.root_path,
+@@ -27,6 +29,9 @@ def data_provider(args, flag, scaler=None, ehr_columns=None):
+         scaler=scaler,
+         ehr_columns=ehr_columns,
+         augment=getattr(args, "augment", True),
++        horizon_days=getattr(args, "horizon_days", None),
++        ehr_drop_groups=getattr(args, "ehr_drop_groups", None),
++        deterministic=deterministic,
+     )
+     loader = DataLoader(
+         dataset,
+@@ -34,6 +39,6 @@ def data_provider(args, flag, scaler=None, ehr_columns=None):
+         shuffle=shuffle,
+         num_workers=args.num_workers,
+         drop_last=drop_last,
+-        pin_memory=True,
++        pin_memory=bool(getattr(args, "use_gpu", False)),
+     )
+     return dataset, loader
+diff --git a/data_provider/data_loader.py b/data_provider/data_loader.py
+index a04aac6..f9846fe 100644
+--- a/data_provider/data_loader.py
++++ b/data_provider/data_loader.py
+@@ -12,6 +12,22 @@ keeping it configurable.
+ 
+ The EHR StandardScaler and median-imputer are fit on the TRAIN split only and
+ shared with val/test (passed in via ``scaler``/``imputer``).
++
++Thesis C additions
++------------------
++* **Administrative censoring at the horizon.** ``build_cohort.py`` records CKD
++  onsets at *any* time after t0 as events, and caps their ``event_bin`` at the
++  last interval. Fed straight into the survival loss, an onset at year 5 was
++  therefore treated as a year-2 event. The dataset now censors every event
++  after ``horizon_days`` (``event_indicator_h`` / ``event_time_h``), which is
++  what all risk heads train on. The raw columns are still returned for
++  reference.
++* ``subject_id`` / ``study_id`` are returned so per-patient risks and risk
++  groups can be exported.
++* ``ehr_drop_groups`` removes whole EHR feature groups (see ``EHR_FEATURE_GROUPS``)
++  for the feature-group ablation.
++* ``deterministic=True`` (used for the Breslow fit and for exporting training
++  risks) disables random cropping and augmentation on the train split.
+ """
+ 
+ import json
+@@ -24,6 +40,32 @@ from torch.utils.data import Dataset
+ 
+ from utils.augmentations import random_augment
+ 
++# EHR feature groups for the ablation study. Columns are matched by prefix, so
++# e.g. 'renal' removes creatinine_last, creatinine_slope, egfr_min, ... .
++EHR_FEATURE_GROUPS = {
++    "demographics": ("age_at_t0", "sex_female"),
++    "renal": ("creatinine_", "egfr_", "bun_"),
++    "labs_other": ("potassium_", "sodium_", "bicarbonate_", "hemoglobin_",
++                   "glucose_", "albumin_"),
++    "comorbidities": ("cmb_",),
++}
++
++
++def filter_ehr_columns(columns, drop_groups):
++    """Remove every column belonging to the named groups (or raw prefixes)."""
++    if not drop_groups:
++        return list(columns)
++    if isinstance(drop_groups, str):
++        drop_groups = [g.strip() for g in drop_groups.split(",") if g.strip()]
++    prefixes = []
++    for g in drop_groups:
++        prefixes.extend(EHR_FEATURE_GROUPS.get(g, (g,)))
++    kept = [c for c in columns if not any(c == p or c.startswith(p) for p in prefixes)]
++    if not kept:
++        raise ValueError(f"ehr_drop_groups={drop_groups} removed every EHR feature; "
++                         "use --use_ehr 0 for an ECG-only model instead")
++    return kept
++
+ 
+ class EHRStandardizer:
+     """Median impute + z-score, fit on train only."""
+@@ -69,16 +111,20 @@ class EHRStandardizer:
+ class MIMICIV_CKD_Dataset(Dataset):
+     def __init__(self, root_path, flag="train", seq_len=250, use_ecg=True,
+                  use_ehr=True, scaler=None, ehr_columns=None, augment=True,
+-                 dataset_file="ckd_dataset_split.parquet"):
++                 dataset_file="ckd_dataset_split.parquet", horizon_days=None,
++                 ehr_drop_groups=None, deterministic=False):
+         self.root_path = root_path
+         self.flag = flag
+         self.seq_len = seq_len
+         self.use_ecg = use_ecg
+         self.use_ehr = use_ehr
+-        self.augment = augment and flag == "train"
++        self.deterministic = deterministic
++        self.augment = augment and flag == "train" and not deterministic
++        self.horizon_days = horizon_days
+ 
+         df = pd.read_parquet(os.path.join(root_path, dataset_file))
+         self.df = df[df["split"] == flag].reset_index(drop=True)
++        self._add_horizon_targets()
+ 
+         # EHR columns
+         col_path = os.path.join(root_path, "ehr_feature_columns.json")
+@@ -88,6 +134,9 @@ class MIMICIV_CKD_Dataset(Dataset):
+             self.ehr_columns = json.load(open(col_path))
+         else:
+             self.ehr_columns = [c for c in self.df.columns if c.startswith(("age", "sex", "cmb_"))]
++        if ehr_columns is None:
++            # only filter when *choosing* columns (train); val/test inherit them
++            self.ehr_columns = filter_ehr_columns(self.ehr_columns, ehr_drop_groups)
+ 
+         self.scaler = scaler
+         if self.use_ehr and self.scaler is None and flag == "train":
+@@ -96,12 +145,24 @@ class MIMICIV_CKD_Dataset(Dataset):
+ 
+         self.ehr_dim = len(self.ehr_columns)
+ 
++    # -- horizon-censored targets ----------------------------------------
++    def _add_horizon_targets(self):
++        t = self.df["event_time_days"].to_numpy(dtype=float)
++        e = self.df["event_indicator"].to_numpy(dtype=float)
++        if self.horizon_days is None:
++            self.df["event_time_h"] = t
++            self.df["event_indicator_h"] = e
++            return
++        after = t > self.horizon_days
++        self.df["event_time_h"] = np.where(after, float(self.horizon_days), t)
++        self.df["event_indicator_h"] = np.where(after, 0.0, e)
++
+     # -- ECG window selection --------------------------------------------
+     def _get_ecg(self, row):
+         arr = np.load(row["ecg_npy"]).astype(np.float32)  # (n_leads, full_len)
+         n_leads, full_len = arr.shape
+         if full_len >= self.seq_len:
+-            if self.flag == "train":
++            if self.flag == "train" and not self.deterministic:
+                 start = np.random.randint(0, full_len - self.seq_len + 1)
+             else:
+                 start = (full_len - self.seq_len) // 2
+@@ -131,4 +192,9 @@ class MIMICIV_CKD_Dataset(Dataset):
+         item["event_bin"] = torch.tensor(int(row["event_bin"]))
+         item["event_indicator"] = torch.tensor(float(row["event_indicator"]))
+         item["event_time_days"] = torch.tensor(float(row["event_time_days"]))
++        # horizon-censored targets: what every risk head trains on
++        item["event_indicator_h"] = torch.tensor(float(row["event_indicator_h"]))
++        item["event_time_h"] = torch.tensor(float(row["event_time_h"]))
++        item["subject_id"] = torch.tensor(int(row["subject_id"]), dtype=torch.long)
++        item["study_id"] = torch.tensor(int(row["study_id"]), dtype=torch.long)
+         return item
+diff --git a/exp/exp_ckd_prognosis.py b/exp/exp_ckd_prognosis.py
+index 714d33f..1bcccd8 100644
+--- a/exp/exp_ckd_prognosis.py
++++ b/exp/exp_ckd_prognosis.py
+@@ -1,5 +1,29 @@
+-"""Experiment for prognostic CKD prediction with CardioformerCKD."""
++"""Experiment for prognostic CKD **risk prediction** with CardioformerCKD.
+ 
++Thesis C: the prognostic layer predicts *risk*, not a binary class.
++
++For every patient the experiment produces
++    risk_score        continuous ranking score (higher = CKD expected sooner)
++    abs_risk_<h>d     predicted probability of incident CKD by each evaluation
++                      horizon h (``--eval_horizons_days``, e.g. 1 y and 2 y)
++    risk_group        low / high (or low / intermediate / high) risk, using
++                      cut-points fitted on the VALIDATION split only
++
++and evaluates
++    discrimination    Harrell's C-index (truncated at the horizon), time-dependent
++                      AUROC at each horizon (horizon-eligible patients only)
++    calibration       IPCW Brier score at each horizon, calibration-in-deciles
++                      table and expected calibration error (ECE)
++    stratification    observed (Kaplan-Meier) CKD incidence per risk group,
++                      log-rank test, hazard ratio high vs low
++    uncertainty       subject-level bootstrap 95% CIs on the headline metrics
++
++Outputs (``<results>/<setting>/``)
++    test_metrics.json, test_predictions.csv, val_predictions.csv,
++    risk_groups.json, km_curves.csv, calibration.csv
++"""
++
++import csv
+ import json
+ import os
+ import time
+@@ -12,21 +36,47 @@ from data_provider.data_factory import data_provider
+ from data_provider.data_loader import EHRStandardizer
+ from exp.exp_basic import Exp_Basic
+ from models.CardioformerCKD import CardioformerCKD
+-from models.heads import DiscreteTimeSurvivalHead
+-from utils.losses import focal_bce, discrete_time_nll
++from models.heads import BreslowBaseline, DiscreteTimeSurvivalHead, horizon_bin_index
++from utils.losses import cox_ph_loss, discrete_time_nll, focal_bce
+ from utils.metrics import (
+-    binary_metrics, brier_score, concordance_index, time_dependent_auroc,
++    bootstrap_ci, concordance_index, horizon_eligibility, time_dependent_auroc,
++)
++from utils.risk_stratification import (
++    assign_groups, fit_thresholds, group_names, summarise_groups,
+ )
++from utils.survival import calibration_table, ipcw_brier_score
+ from utils.tools import EarlyStopping, adjust_learning_rate, set_seed
+ 
+ 
++def _parse_horizons(s, default):
++    if s is None or s == "":
++        return [float(default)]
++    if isinstance(s, (int, float)):
++        return [float(s)]
++    return [float(x) for x in str(s).split(",") if str(x).strip()]
++
++
++def _hkey(h):
++    return f"{int(round(h))}d"
++
++
+ class Exp_CKD_Prognosis(Exp_Basic):
+     def __init__(self, args):
+         set_seed(args.seed)
++        self.horizon = float(getattr(args, "horizon_days", 730))
++        self.eval_horizons = _parse_horizons(getattr(args, "eval_horizons_days", None),
++                                             self.horizon)
++        if self.horizon not in self.eval_horizons:
++            self.eval_horizons.append(self.horizon)
++        self.eval_horizons = sorted(self.eval_horizons)
++        self.strat_horizon = float(getattr(args, "risk_strat_horizon_days", None) or self.horizon)
++        self.baseline = None  # Breslow baseline hazard (cox head only)
++
+         # discover ehr_in_dim from the train dataset before building the model
+         self.train_data, self.train_loader = data_provider(args, "train")
+         self._scaler = self.train_data.scaler
+         self._ehr_columns = self.train_data.ehr_columns
++        self._check_bins(args)
+ 
+         # For eval-only runs, prefer the scaler persisted alongside the checkpoint
+         # so preprocessing at test time is byte-identical to training.
+@@ -37,6 +87,18 @@ class Exp_CKD_Prognosis(Exp_Basic):
+         args.ehr_in_dim = len(self._ehr_columns)
+         super().__init__(args)
+ 
++    # ---- setup helpers ---------------------------------------------------
++    def _check_bins(self, args):
++        if args.head != "survival":
++            return
++        max_bin = int(self.train_data.df["event_bin"].max()) if len(self.train_data) else 0
++        if max_bin >= args.n_intervals:
++            raise ValueError(
++                f"cohort was built with more survival bins (max event_bin={max_bin}) than "
++                f"--n_intervals={args.n_intervals}; rebuild the cohort or match n_intervals")
++        for h in self.eval_horizons:
++            horizon_bin_index(h, self.horizon, args.n_intervals)   # raises if h > horizon
++
+     def _load_saved_scaler(self, path):
+         if not os.path.exists(path):
+             return False
+@@ -49,9 +111,12 @@ class Exp_CKD_Prognosis(Exp_Basic):
+     def _build_model(self):
+         return CardioformerCKD(self.args)
+ 
+-    def _get_data(self, flag):
+-        return data_provider(self.args, flag,
+-                             scaler=self._scaler, ehr_columns=self._ehr_columns)
++    def _get_data(self, flag, deterministic=False):
++        return data_provider(self.args, flag, scaler=self._scaler,
++                             ehr_columns=self._ehr_columns, deterministic=deterministic)
++
++    def _baseline_file(self):
++        return os.path.join(os.path.dirname(self.checkpoint_file()), "baseline_hazard.json")
+ 
+     # ---- batching helpers ----------------------------------------------
+     def _to_device(self, batch):
+@@ -64,29 +129,34 @@ class Exp_CKD_Prognosis(Exp_Basic):
+         return x_ecg, ehr
+ 
+     def _compute_loss(self, out, batch):
+-        if self.args.head == "binary":
++        head = self.args.head
++        if head == "binary":
+             y = batch["label_binary"].to(self.device)
+             elig = batch["eligible_binary"].to(self.device).bool()
+             if elig.sum() == 0:
+                 return out.sum() * 0.0
+             return focal_bce(out[elig], y[elig],
+                              alpha=self.args.focal_alpha, gamma=self.args.focal_gamma)
+-        else:  # survival
+-            event_bin = batch["event_bin"].to(self.device)
+-            event_ind = batch["event_indicator"].to(self.device)
+-            return discrete_time_nll(out, event_bin, event_ind)
++        if head == "cox":
++            return cox_ph_loss(out, batch["event_time_h"].to(self.device),
++                               batch["event_indicator_h"].to(self.device))
++        # survival: horizon-censored indicator (events after the horizon are censored)
++        return discrete_time_nll(out, batch["event_bin"].to(self.device),
++                                 batch["event_indicator_h"].to(self.device))
+ 
+     # ---- main loops -----------------------------------------------------
+     def train(self):
+-        _, train_loader = self.train_data, self.train_loader
++        train_loader = self.train_loader
+         _, vali_loader = self._get_data("val")
+ 
+         path = self.checkpoint_dir()
+         os.makedirs(path, exist_ok=True)
+-        # persist the fitted scaler for inference
+         if self._scaler is not None:
+             json.dump(self._scaler.state_dict(),
+                       open(os.path.join(path, "ehr_scaler.json"), "w"))
++        json.dump({k: v for k, v in vars(self.args).items()
++                   if isinstance(v, (int, float, str, bool, list, type(None)))},
++                  open(os.path.join(path, "args.json"), "w"), indent=2)
+ 
+         optimizer = optim.Adam(self.model.parameters(), lr=self.args.learning_rate,
+                                weight_decay=self.args.weight_decay)
+@@ -101,15 +171,16 @@ class Exp_CKD_Prognosis(Exp_Basic):
+                 x_ecg, ehr = self._to_device(batch)
+                 out = self.model(x_ecg=x_ecg, ehr=ehr)
+                 loss = self._compute_loss(out, batch)
+-                loss.backward()
+-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 4.0)
+-                optimizer.step()
++                if loss.requires_grad:
++                    loss.backward()
++                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 4.0)
++                    optimizer.step()
+                 losses.append(loss.item())
+ 
+             val_score, val_metrics = self.validate(vali_loader)
+             lr_now = optimizer.param_groups[0]["lr"]
+             print(f"Epoch {epoch+1} | lr {lr_now:.2e} | train_loss {np.mean(losses):.4f} | "
+-                  f"val_score {val_score:.4f} | {val_metrics} | "
++                  f"val_{self.args.early_stop_metric} {val_score:.4f} | {val_metrics} | "
+                   f"{time.time()-t0:.1f}s")
+ 
+             early(val_score, self.model, path)
+@@ -120,76 +191,265 @@ class Exp_CKD_Prognosis(Exp_Basic):
+ 
+         # restore the best weights before returning / testing
+         self.load_checkpoint(os.path.join(path, "checkpoint.pth"))
++        if self.args.head == "cox":
++            self.fit_baseline()
+         return self.model
+ 
++    # ---- inference -------------------------------------------------------
+     @torch.no_grad()
+-    def validate(self, loader):
++    def predict(self, loader):
++        """Run the model over ``loader`` and return per-patient arrays."""
+         self.model.eval()
+-        probs, labels, elig = [], [], []
+-        risks, times, events = [], [], []
+-        horizon_bin = self.args.n_intervals - 1
++        head = self.args.head
++        raw, cols = [], {k: [] for k in (
++            "subject_id", "study_id", "event_time_days", "event_indicator",
++            "event_time_h", "event_indicator_h", "label_binary", "eligible_binary")}
+         for batch in loader:
+             x_ecg, ehr = self._to_device(batch)
+             out = self.model(x_ecg=x_ecg, ehr=ehr)
+-            if self.args.head == "binary":
+-                probs.append(torch.sigmoid(out).cpu().numpy())
+-                labels.append(batch["label_binary"].numpy())
+-                elig.append(batch["eligible_binary"].numpy())
+-            else:
++            if head == "survival":
+                 _, cif = DiscreteTimeSurvivalHead.survival_from_hazards(out)
+-                cif = cif.cpu().numpy()
+-                risks.append(cif[:, horizon_bin])          # risk by horizon
+-                times.append(batch["event_time_days"].numpy())
+-                events.append(batch["event_indicator"].numpy())
+-                labels.append(batch["label_binary"].numpy())
+-                elig.append(batch["eligible_binary"].numpy())
+-
+-        labels = np.concatenate(labels)
+-        elig = np.concatenate(elig).astype(bool)
+-
+-        if self.args.head == "binary":
+-            probs = np.concatenate(probs)
+-            m = binary_metrics(labels[elig], probs[elig])
+-            m["n_eligible"] = int(elig.sum())
+-            m["n_total"] = int(elig.size)
+-            return m.get("auroc", float("nan")), m
+-
+-        risks = np.concatenate(risks)
+-        times = np.concatenate(times)
+-        events = np.concatenate(events)
+-
+-        # C-index uses everyone (right-censoring is handled by the pair definition).
+-        cidx = concordance_index(times, risks, events)
+-        # The fixed-horizon metrics may only use patients whose horizon label is
+-        # actually known: an event by the horizon, or follow-up reaching it.
+-        # Passing the eligibility mask here is what stops patients censored early
+-        # from being silently scored as negatives (which inflates the AUROC).
+-        td_auroc = time_dependent_auroc(risks, labels, eligible_mask=elig)
+-        brier = brier_score(labels[elig], risks[elig]) if elig.any() else float("nan")
+-
+-        metrics = {
+-            "c_index": round(float(cidx), 4),
+-            "td_auroc": round(float(td_auroc), 4),
+-            "brier_at_horizon": round(float(brier), 4),
+-            "n_eligible": int(elig.sum()),
+-            "n_total": int(elig.size),
++                raw.append(cif.cpu().numpy())
++            elif head == "cox":
++                raw.append(out.cpu().numpy())
++            else:
++                raw.append(torch.sigmoid(out).cpu().numpy())
++            for k in cols:
++                cols[k].append(batch[k].numpy())
++        pred = {k: np.concatenate(v) if v else np.array([]) for k, v in cols.items()}
++        raw = np.concatenate(raw) if raw else np.zeros((0,))
++        pred["raw"] = raw
++        pred.update(self._risk_from_raw(raw))
++        return pred
++
++    def _risk_from_raw(self, raw):
++        """Map head output to (risk_score, abs_risk matrix over eval horizons)."""
++        head, K = self.args.head, getattr(self.args, "n_intervals", 8)
++        n = raw.shape[0]
++        abs_risk = np.full((n, len(self.eval_horizons)), np.nan)
++        if head == "survival":
++            for j, h in enumerate(self.eval_horizons):
++                abs_risk[:, j] = raw[:, horizon_bin_index(h, self.horizon, K)]
++            score = raw[:, horizon_bin_index(self.strat_horizon, self.horizon, K)]
++        elif head == "cox":
++            score = raw.reshape(-1)
++            if self.baseline is not None and n:
++                abs_risk = self.baseline.abs_risk(score, self.eval_horizons)
++        else:  # binary: a probability at the horizon only
++            score = raw.reshape(-1)
++            abs_risk[:, self.eval_horizons.index(self.horizon)] = score
++        return {"risk_score": score, "abs_risk": abs_risk}
++
++    def fit_baseline(self):
++        """Fit (and persist) the Breslow baseline hazard on the training split."""
++        _, loader = self._get_data("train", deterministic=True)
++        self.baseline = None
++        p = self.predict(loader)
++        self.baseline = BreslowBaseline().fit(p["risk_score"], p["event_time_h"],
++                                              p["event_indicator_h"])
++        json.dump(self.baseline.state_dict(), open(self._baseline_file(), "w"))
++        print(f"[cox] Breslow baseline hazard fitted on {len(p['risk_score'])} training rows")
++
++    def _load_or_fit_baseline(self):
++        path = self._baseline_file()
++        if os.path.exists(path):
++            self.baseline = BreslowBaseline().load_state_dict(json.load(open(path)))
++            print(f"[cox] loaded baseline hazard from {path}")
++        else:
++            self.fit_baseline()
++
++    # ---- evaluation -------------------------------------------------------
++    def evaluate(self, pred, train_pred=None):
++        """Discrimination + calibration metrics from a ``predict`` dict."""
++        t_raw, e_raw = pred["event_time_days"], pred["event_indicator"]
++        t_h, e_h = pred["event_time_h"], pred["event_indicator_h"]
++        score = pred["risk_score"]
++        m = {
++            # C-index truncated at the horizon (horizon-censored follow-up): the
++            # model predicts risk *within* the horizon, so ranking beyond it is
++            # not what it was trained to do.
++            "c_index": round(float(concordance_index(t_h, score, e_h)), 4),
++            # untruncated, for comparability with Thesis B numbers
++            "c_index_untruncated": round(float(concordance_index(t_raw, score, e_raw)), 4),
++            "n_total": int(len(score)),
++            "n_events_by_horizon": int(e_h.sum()),
+         }
+-        score = cidx if not np.isnan(cidx) else 0.0
+-        return score, metrics
++        # IPCW Brier uses the *raw* follow-up: a patient event-free past h must
++        # have T > h to count as a control, which horizon-truncated times hide.
++        ct = train_pred["event_time_days"] if train_pred is not None else None
++        ce = train_pred["event_indicator"] if train_pred is not None else None
++        for j, h in enumerate(self.eval_horizons):
++            elig = horizon_eligibility(t_raw, e_raw, h)
++            lab = ((e_raw == 1) & (t_raw <= h)).astype(int)
++            r = pred["abs_risk"][:, j]
++            r_rank = r if np.isfinite(r).all() else score
++            m[f"td_auroc_{_hkey(h)}"] = round(float(time_dependent_auroc(r_rank, lab, elig)), 4)
++            m[f"n_eligible_{_hkey(h)}"] = int(elig.sum())
++            m[f"brier_ipcw_{_hkey(h)}"] = (
++                round(ipcw_brier_score(t_raw, e_raw, r, h, ct, ce), 4)
++                if np.isfinite(r).all() and len(r) else float("nan"))
++        # backward-compatible keys at the primary horizon
++        m["td_auroc"] = m[f"td_auroc_{_hkey(self.horizon)}"]
++        m["brier_at_horizon"] = m[f"brier_ipcw_{_hkey(self.horizon)}"]
++        m["n_eligible"] = m[f"n_eligible_{_hkey(self.horizon)}"]
++        return m
++
++    @torch.no_grad()
++    def validate(self, loader):
++        pred = self.predict(loader)
++        m = self.evaluate(pred)
++        key = getattr(self.args, "early_stop_metric", "c_index")
++        key = "td_auroc" if key == "td_auroc" else "c_index"
++        score = m[key]
++        return (score if np.isfinite(score) else 0.0), m
++
++    def _bootstrap(self, pred):
++        n_boot = int(getattr(self.args, "n_bootstrap", 0) or 0)
++        if n_boot <= 0 or len(pred["risk_score"]) == 0:
++            return {}
++        t_h, e_h, s = pred["event_time_h"], pred["event_indicator_h"], pred["risk_score"]
++        t_raw, e_raw = pred["event_time_days"], pred["event_indicator"]
++        j = self.eval_horizons.index(self.horizon)
++        r = pred["abs_risk"][:, j]
++        r = r if np.isfinite(r).all() else s
++        H = self.horizon
++
++        def cidx(ix):
++            return concordance_index(t_h[ix], s[ix], e_h[ix])
++
++        def auroc(ix):
++            el = horizon_eligibility(t_raw[ix], e_raw[ix], H)
++            lab = ((e_raw[ix] == 1) & (t_raw[ix] <= H)).astype(int)
++            return time_dependent_auroc(r[ix], lab, el)
++
++        out = {}
++        for name, fn in (("c_index", cidx), (f"td_auroc_{_hkey(H)}", auroc)):
++            lo, hi = bootstrap_ci(fn, pred["subject_id"], n_boot=n_boot,
++                                  seed=int(self.args.seed))
++            out[f"{name}_ci95"] = [round(lo, 4), round(hi, 4)]
++        return out
++
++    def stratify(self, val_pred, test_pred):
++        """Fit risk cut-points on validation, apply to test, summarise groups."""
++        a = self.args
++        j = self.eval_horizons.index(self.strat_horizon) if self.strat_horizon in self.eval_horizons else -1
++        val_abs = val_pred["abs_risk"][:, j] if j >= 0 else None
++        th = fit_thresholds(
++            val_pred["risk_score"], method=a.risk_strat_method,
++            quantiles=a.risk_strat_quantiles, cutoffs=a.risk_strat_cutoffs,
++            val_label=((val_pred["event_indicator"] == 1) &
++                       (val_pred["event_time_days"] <= self.strat_horizon)).astype(int),
++            val_eligible=horizon_eligibility(val_pred["event_time_days"],
++                                             val_pred["event_indicator"], self.strat_horizon),
++            target_sensitivity=a.risk_strat_target_sens,
++            val_abs_risk=val_abs,
++        )
++        if th["on"] == "abs_risk":
++            vals_test = test_pred["abs_risk"][:, j]
++            if not np.isfinite(vals_test).all():
++                raise ValueError("absolute-risk stratification needs absolute risk at the "
++                                 "stratification horizon (not available for this head)")
++        else:
++            vals_test = test_pred["risk_score"]
++        groups = assign_groups(vals_test, th["thresholds"])
++        names = group_names(len(th["thresholds"]) + 1)
++        abs_test = test_pred["abs_risk"][:, j] if j >= 0 else None
++        abs_test = abs_test if abs_test is not None and np.isfinite(abs_test).all() else None
++        summ = summarise_groups(test_pred["event_time_h"], test_pred["event_indicator_h"],
++                                groups, abs_risk=abs_test, horizon=self.strat_horizon,
++                                names=names)
++        summ["thresholds"] = th
++        summ["horizon_days"] = self.strat_horizon
++        return groups, names, summ
+ 
+     @torch.no_grad()
+     def test(self):
+         # Always evaluate the saved best weights, never whatever happens to be in
+         # memory. Required when --is_training 0: without this the model is random.
+         self.load_checkpoint()
++        if self.args.head == "cox":
++            self._load_or_fit_baseline()
++
++        out_dir = os.path.join(self.args.results, self.args.setting)
++        os.makedirs(out_dir, exist_ok=True)
+ 
++        _, val_loader = self._get_data("val")
+         _, test_loader = self._get_data("test")
+-        score, metrics = self.validate(test_loader)
++        _, train_loader = self._get_data("train", deterministic=True)
++        train_pred = self.predict(train_loader)   # censoring distribution for IPCW
++        val_pred = self.predict(val_loader)
++        test_pred = self.predict(test_loader)
++
++        metrics = self.evaluate(test_pred, train_pred=train_pred)
++        metrics.update(self._bootstrap(test_pred))
++
++        # calibration at the stratification horizon
++        j = self.eval_horizons.index(self.strat_horizon) if self.strat_horizon in self.eval_horizons else -1
++        if j >= 0 and np.isfinite(test_pred["abs_risk"][:, j]).all():
++            cal_rows, ece = calibration_table(
++                test_pred["event_time_h"], test_pred["event_indicator_h"],
++                test_pred["abs_risk"][:, j], self.strat_horizon,
++                n_bins=int(getattr(self.args, "calibration_bins", 10)))
++            metrics[f"ece_{_hkey(self.strat_horizon)}"] = round(ece, 4)
++            self._write_csv(os.path.join(out_dir, "calibration.csv"), cal_rows)
++
++        # risk stratification (cut-points from validation only)
++        groups, names, summ = self.stratify(val_pred, test_pred)
++        metrics["risk_strat_method"] = summ["thresholds"]["method"]
++        metrics["logrank_p"] = summ["logrank_p"]
++        metrics["hr_high_vs_low"] = round(summ["hr_high_vs_low"], 4)
++        metrics["hr_high_vs_low_ci95"] = [round(summ["hr_lo"], 4), round(summ["hr_hi"], 4)]
++        for g in summ["groups"]:
++            metrics[f"observed_risk_{g['group']}"] = round(g["observed_risk_km"], 4)
++            metrics[f"n_{g['group']}"] = g["n"]
++
+         metrics["checkpoint"] = self.checkpoint_file()
+         metrics["setting"] = self.args.setting
++        metrics["head"] = self.args.head
++        metrics["eval_horizons_days"] = self.eval_horizons
+ 
+-        out_dir = os.path.join(self.args.results, self.args.setting)
+-        os.makedirs(out_dir, exist_ok=True)
++        # ---- write everything ------------------------------------------------
+         json.dump(metrics, open(os.path.join(out_dir, "test_metrics.json"), "w"), indent=2)
+-        print(f"[test] score={score:.4f} metrics={metrics}")
++        km = {"km_grid_days": summ.pop("km_grid_days"),
++              "curves": summ.pop("km_cumulative_incidence")}
++        json.dump(summ, open(os.path.join(out_dir, "risk_groups.json"), "w"), indent=2)
++        km_rows = [dict({"day": d}, **{name: km["curves"][name][i] for name in km["curves"]})
++                   for i, d in enumerate(km["km_grid_days"])]
++        self._write_csv(os.path.join(out_dir, "km_curves.csv"), km_rows)
++        self._write_predictions(os.path.join(out_dir, "test_predictions.csv"), test_pred,
++                                [names[g] for g in groups])
++        val_groups = assign_groups(
++            val_pred["risk_score"] if summ["thresholds"]["on"] == "score"
++            else val_pred["abs_risk"][:, j], summ["thresholds"]["thresholds"])
++        self._write_predictions(os.path.join(out_dir, "val_predictions.csv"), val_pred,
++                                [names[g] for g in val_groups])
++
++        print(f"[test] {json.dumps({k: v for k, v in metrics.items() if k != 'checkpoint'})}")
++        print(f"[test] risk groups: " + " | ".join(
++            f"{g['group']}: n={g['n']} observed {self.strat_horizon:.0f}d risk "
++            f"{g['observed_risk_km']:.3f}" for g in summ["groups"]))
+         return metrics
++
++    # ---- writers -----------------------------------------------------------
++    @staticmethod
++    def _write_csv(path, rows):
++        if not rows:
++            return
++        with open(path, "w", newline="") as f:
++            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
++            w.writeheader()
++            w.writerows(rows)
++
++    def _write_predictions(self, path, pred, group_labels):
++        rows = []
++        for i in range(len(pred["risk_score"])):
++            r = {"subject_id": int(pred["subject_id"][i]), "study_id": int(pred["study_id"][i]),
++                 "risk_score": float(pred["risk_score"][i])}
++            for j, h in enumerate(self.eval_horizons):
++                r[f"abs_risk_{_hkey(h)}"] = float(pred["abs_risk"][i, j])
++            r["risk_group"] = group_labels[i]
++            r["event_time_days"] = float(pred["event_time_days"][i])
++            r["event_indicator"] = int(pred["event_indicator"][i])
++            r["event_by_horizon"] = int(pred["event_indicator_h"][i])
++            rows.append(r)
++        self._write_csv(path, rows)
+diff --git a/layers/Cardioformer_EncDec.py b/layers/Cardioformer_EncDec.py
+index 74959f7..35df1d2 100644
+--- a/layers/Cardioformer_EncDec.py
++++ b/layers/Cardioformer_EncDec.py
+@@ -32,8 +32,14 @@ class FeedForward(nn.Module):
+ 
+ 
+ class TwoStageEncoderLayer(nn.Module):
+-    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
++    """``inter_granularity=False`` skips stage 2 (ablation): each granularity is
++    then encoded independently and never exchanges information with the others.
++    The inter-granularity parameters are still created so state dicts keep the
++    same keys, but they receive no gradient."""
++
++    def __init__(self, d_model, n_heads, d_ff, dropout=0.1, inter_granularity=True):
+         super().__init__()
++        self.inter_granularity = inter_granularity
+         # intra-granularity
+         self.intra_attn = MultiHeadAttention(d_model, n_heads, dropout)
+         self.intra_norm = nn.LayerNorm(d_model)
+@@ -57,6 +63,8 @@ class TwoStageEncoderLayer(nn.Module):
+             routers.append(s.mean(dim=1, keepdim=True))  # (B,1,d) summary token
+ 
+         # ---- Stage 2: inter-granularity attention over router tokens -----
++        if not self.inter_granularity:
++            return [self.ffn_norm(s + self.dropout(self.ffn(s))) for s in updated]
+         router_seq = torch.cat(routers, dim=1)            # (B, G, d_model)
+         r, _ = self.inter_attn(router_seq, router_seq, router_seq)
+         router_seq = self.inter_norm(router_seq + self.dropout(r))  # (B, G, d_model)
+@@ -72,10 +80,12 @@ class TwoStageEncoderLayer(nn.Module):
+ 
+ 
+ class CardioformerEncoder(nn.Module):
+-    def __init__(self, n_layers, d_model, n_heads, d_ff, dropout=0.1):
++    def __init__(self, n_layers, d_model, n_heads, d_ff, dropout=0.1, inter_granularity=True):
+         super().__init__()
+         self.layers = nn.ModuleList([
+-            TwoStageEncoderLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)
++            TwoStageEncoderLayer(d_model, n_heads, d_ff, dropout,
++                                 inter_granularity=inter_granularity)
++            for _ in range(n_layers)
+         ])
+         self.norm = nn.LayerNorm(d_model)
+ 
+diff --git a/layers/Embed.py b/layers/Embed.py
+index 2470f37..e117214 100644
+--- a/layers/Embed.py
++++ b/layers/Embed.py
+@@ -36,6 +36,21 @@ class PositionalEmbedding(nn.Module):
+         return self.pe[:, : x.size(1)]
+ 
+ 
++class LinearPatchEncoder(nn.Module):
++    """Flatten a (N, C, patch_len) patch and project it linearly to d_model.
++
++    Used only for the ablation that replaces Cardioformer's ResNet patch encoder
++    with the flatten-and-project embedding of PatchTST / Medformer.
++    """
++
++    def __init__(self, in_channels, patch_len, d_model):
++        super().__init__()
++        self.proj = nn.Linear(in_channels * patch_len, d_model)
++
++    def forward(self, x):
++        return self.proj(x.reshape(x.size(0), -1))
++
++
+ class CrossChannelPatch(nn.Module):
+     """Patch a multi-lead signal at a single granularity (patch length).
+ 
+@@ -44,16 +59,23 @@ class CrossChannelPatch(nn.Module):
+     """
+ 
+     def __init__(self, n_leads, patch_len, d_model, stride=None,
+-                 resnet_hidden=64, resnet_blocks=2, dropout=0.1, cross_channel=True):
++                 resnet_hidden=64, resnet_blocks=2, dropout=0.1, cross_channel=True,
++                 patch_encoder="resnet"):
+         super().__init__()
+         self.patch_len = patch_len
+         self.stride = stride or patch_len  # non-overlapping by default
+         self.cross_channel = cross_channel
+         in_channels = n_leads if cross_channel else 1
+-        self.encoder = ResNetPatchEncoder(
+-            in_channels=in_channels, d_model=d_model,
+-            hidden=resnet_hidden, n_blocks=resnet_blocks, dropout=dropout,
+-        )
++        if patch_encoder == "resnet":
++            self.encoder = ResNetPatchEncoder(
++                in_channels=in_channels, d_model=d_model,
++                hidden=resnet_hidden, n_blocks=resnet_blocks, dropout=dropout,
++            )
++        elif patch_encoder == "linear":
++            # Ablation: PatchTST/Medformer-style flatten + linear projection
++            self.encoder = LinearPatchEncoder(in_channels, patch_len, d_model)
++        else:
++            raise ValueError(f"unknown patch_encoder {patch_encoder!r}")
+         self.n_leads = n_leads
+ 
+     def forward(self, x):
+@@ -97,7 +119,8 @@ class MultiGranularityEmbedding(nn.Module):
+     """
+ 
+     def __init__(self, n_leads, patch_lens, d_model, dropout=0.1,
+-                 resnet_hidden=64, resnet_blocks=2, cross_channel=True):
++                 resnet_hidden=64, resnet_blocks=2, cross_channel=True,
++                 patch_encoder="resnet"):
+         super().__init__()
+         self.patch_lens = list(patch_lens)
+         self.embeds = nn.ModuleList([
+@@ -105,6 +128,7 @@ class MultiGranularityEmbedding(nn.Module):
+                 n_leads=n_leads, patch_len=p, d_model=d_model,
+                 resnet_hidden=resnet_hidden, resnet_blocks=resnet_blocks,
+                 dropout=dropout, cross_channel=cross_channel,
++                patch_encoder=patch_encoder,
+             )
+             for p in self.patch_lens
+         ])
+diff --git a/models/Cardioformer.py b/models/Cardioformer.py
+index b6279cf..57e1897 100644
+--- a/models/Cardioformer.py
++++ b/models/Cardioformer.py
+@@ -35,6 +35,9 @@ dropout          : dropout rate
+ patch_len_list   : comma-separated granularities, e.g. "2,4,8,8,16,16,16,16,32"
+ num_class        : number of classes (classification task only)
+ cross_channel    : bool, use cross-channel patching (default True)
++patch_encoder    : 'resnet' (default, as in the paper) | 'linear' (ablation)
++inter_granularity: bool, stage-2 inter-granularity attention (default True;
++                   False is an ablation)
+ """
+ 
+ import torch
+@@ -71,6 +74,7 @@ class Model(nn.Module):
+             resnet_hidden=getattr(configs, "resnet_hidden", 64),
+             resnet_blocks=getattr(configs, "resnet_blocks", 2),
+             cross_channel=getattr(configs, "cross_channel", True),
++            patch_encoder=getattr(configs, "patch_encoder", "resnet"),
+         )
+         self.encoder = CardioformerEncoder(
+             n_layers=configs.e_layers,
+@@ -78,6 +82,7 @@ class Model(nn.Module):
+             n_heads=configs.n_heads,
+             d_ff=configs.d_ff,
+             dropout=configs.dropout,
++            inter_granularity=getattr(configs, "inter_granularity", True),
+         )
+         self.embed_dim = configs.d_model  # per-granularity pooled dim
+ 
+diff --git a/models/CardioformerCKD.py b/models/CardioformerCKD.py
+index 778a06b..521eca3 100644
+--- a/models/CardioformerCKD.py
++++ b/models/CardioformerCKD.py
+@@ -8,17 +8,20 @@ Architecture
+                                                                │
+                           ┌────────── fusion (concat | gated | cross-attn) ──────────┐
+                           ▼                                                            ▼
+-                   fused (B, d_fuse)                                        prognostic head(s)
+-                                                                  binary horizon  /  discrete-time survival
++                   fused (B, d_fuse)                               prognostic RISK layer (Thesis C)
++                                              discrete-time survival (default) | Cox PH | [binary: ablation only]
++                                                        -> risk score + absolute risk CIF(t) per patient
++                                                        -> risk groups (utils/risk_stratification.py)
+ 
+ The model is *prognostic*: features come from a window strictly before the index
+ time; labels describe CKD onset within a future horizon. Leakage control lives in
+ the cohort builder (``data_preprocessing/build_cohort.py``), not here.
+ 
+ ``configs`` reuses the Cardioformer attributes (see models/Cardioformer.py) plus:
+-ehr_in_dim, ehr_mode ('mlp'|'seq'), fusion ('concat'|'gated'|'cross'),
++ehr_in_dim, ehr_mode ('mlp'|'seq'|'identity'), fusion ('concat'|'gated'|'cross'),
+ cross_attn_tokens ('patches'|'granularity', cross fusion only),
+-head ('binary'|'survival'), n_intervals (survival only), use_ecg, use_ehr.
++head ('survival'|'cox'|'binary'), head_hidden (0 = linear head),
++n_intervals (survival only), use_ecg, use_ehr.
+ 
+ Provenance: the ECG backbone is a clean-room re-implementation of Cardioformer
+ from the paper (Mobin et al., 2025, arXiv:2505.05538), not the authors' code.
+@@ -29,8 +32,8 @@ import torch
+ import torch.nn as nn
+ 
+ from models.Cardioformer import Model as CardioformerBackbone
+-from models.ehr_encoder import EHRMLPEncoder, EHRSequenceEncoder
+-from models.heads import BinaryHorizonHead, DiscreteTimeSurvivalHead
++from models.ehr_encoder import EHRIdentityEncoder, EHRMLPEncoder, EHRSequenceEncoder
++from models.heads import BinaryHorizonHead, CoxRiskHead, DiscreteTimeSurvivalHead
+ 
+ 
+ class GatedFusion(nn.Module):
+@@ -117,11 +120,14 @@ class CardioformerCKD(nn.Module):
+ 
+         # --- EHR branch -----------------------------------------------------
+         if self.use_ehr:
+-            if getattr(configs, "ehr_mode", "mlp") == "seq":
++            ehr_mode = getattr(configs, "ehr_mode", "mlp")
++            if ehr_mode == "seq":
+                 self.ehr = EHRSequenceEncoder(
+                     n_features=configs.ehr_in_dim, d_model=configs.d_model,
+                     dropout=getattr(configs, "ehr_dropout", 0.2),
+                 )
++            elif ehr_mode == "identity":
++                self.ehr = EHRIdentityEncoder(configs.ehr_in_dim)
+             else:
+                 self.ehr = EHRMLPEncoder(
+                     in_dim=configs.ehr_in_dim, embed_dim=configs.d_model,
+@@ -151,13 +157,18 @@ class CardioformerCKD(nn.Module):
+             self.fuse = None
+             d_fuse = d_ecg + d_ehr
+ 
+-        # --- prognostic head ------------------------------------------------
+-        if self.head_type == "binary":
+-            self.head = BinaryHorizonHead(d_fuse)
+-        elif self.head_type == "survival":
++        # --- prognostic risk layer -----------------------------------------
++        head_hidden = int(getattr(configs, "head_hidden", 128))
++        head_dropout = float(getattr(configs, "head_dropout", 0.2))
++        if self.head_type == "survival":
+             self.head = DiscreteTimeSurvivalHead(
+-                d_fuse, n_intervals=getattr(configs, "n_intervals", 8)
++                d_fuse, n_intervals=getattr(configs, "n_intervals", 8),
++                hidden=head_hidden, dropout=head_dropout,
+             )
++        elif self.head_type == "cox":
++            self.head = CoxRiskHead(d_fuse, hidden=head_hidden, dropout=head_dropout)
++        elif self.head_type == "binary":
++            self.head = BinaryHorizonHead(d_fuse, hidden=head_hidden, dropout=head_dropout)
+         else:
+             raise ValueError(f"unknown head: {self.head_type}")
+ 
+diff --git a/models/ehr_encoder.py b/models/ehr_encoder.py
+index ef94190..e62bb74 100644
+--- a/models/ehr_encoder.py
++++ b/models/ehr_encoder.py
+@@ -8,7 +8,11 @@ Two options are provided:
+   longitudinal measurements (e.g. monthly-binned labs before the index time),
+   for users who build a temporal EHR tensor.
+ 
+-Both expose ``.embed_dim`` and return a (B, embed_dim) embedding.
++* ``EHRIdentityEncoder`` — passes the standardised features through unchanged.
++  Combined with a linear Cox head this is a classical Cox PH model, used as the
++  non-deep baseline in the ablation study.
++
++All expose ``.embed_dim`` and return a (B, embed_dim) embedding.
+ """
+ 
+ import torch
+@@ -37,6 +41,15 @@ class EHRMLPEncoder(nn.Module):
+         return self.net(x)
+ 
+ 
++class EHRIdentityEncoder(nn.Module):
++    def __init__(self, in_dim):
++        super().__init__()
++        self.embed_dim = in_dim
++
++    def forward(self, x):
++        return x
++
++
+ class EHRSequenceEncoder(nn.Module):
+     """Transformer encoder over (B, T, F) longitudinal EHR features.
+ 
+diff --git a/models/heads.py b/models/heads.py
+index 3eb22df..416382d 100644
+--- a/models/heads.py
++++ b/models/heads.py
+@@ -1,33 +1,57 @@
+-"""Prognostic heads.
++"""Prognostic risk-prediction heads (the "prognostic layer").
+ 
+-A *prognostic* CKD model predicts future onset, not the present state. Two heads
+-are provided:
++Thesis C change: the prognostic layer is a **risk-prediction** layer, not a
++binary classifier. Every head below is wrapped so that, at inference, the model
++produces the same two things for every patient:
+ 
+-* ``BinaryHorizonHead`` — single logit for "develops CKD within H days".
+-  Simple, but discards patients censored before H.
++* ``risk_score``   a continuous ranking score (higher = CKD expected sooner), used
++                   for the C-index and for risk stratification;
++* ``abs_risk(t)``  an absolute, calibrated probability of incident CKD by time t
++                   (the cumulative incidence function, CIF), used for
++                   calibration, the Brier score and absolute-risk cut-points.
+ 
+-* ``DiscreteTimeSurvivalHead`` — predicts a conditional hazard for each of K
+-  discrete time intervals. Handles right-censoring properly and yields a full
+-  survival curve S(t) and cumulative incidence 1 - S(t). This is the recommended
+-  head for a genuine prognostic model.
++Heads
++-----
++``DiscreteTimeSurvivalHead`` (default, ``--head survival``)
++    K conditional hazards h_k = P(event in interval k | event-free at start of k).
++    S(t_k) = prod_{j<=k} (1 - h_j), CIF = 1 - S. Handles right-censoring and gives
++    a full risk curve over the horizon (Gensheimer & Narasimhan, 2019).
+ 
+-See ``utils.losses`` for the matching loss functions and ``utils.metrics`` for
+-time-dependent evaluation (C-index, time-dependent AUROC).
++``CoxRiskHead`` (``--head cox``)
++    A single log-risk eta = f(x) trained with the Cox partial likelihood
++    (DeepSurv; Katzman et al., 2018). Absolute risk comes from a Breslow
++    baseline hazard fitted on the training set after training:
++    CIF(t | x) = 1 - exp(-H0(t) * exp(eta)).
++
++``BinaryHorizonHead`` (``--head binary``)
++    Single logit for "CKD by the horizon". Kept **only as an ablation baseline**:
++    it discards patients censored before the horizon and gives no risk curve.
++
++``head_hidden=0`` makes any head a single linear layer, which with
++``--ehr_mode identity --use_ecg 0 --head cox`` reproduces a classical linear Cox
++proportional-hazards model on the EHR features (the non-deep baseline).
+ """
+ 
++import numpy as np
+ import torch
+ import torch.nn as nn
+ 
+ 
++def _mlp(in_dim, out_dim, hidden, dropout):
++    if not hidden:
++        return nn.Linear(in_dim, out_dim)
++    return nn.Sequential(
++        nn.Linear(in_dim, hidden),
++        nn.GELU(),
++        nn.Dropout(dropout),
++        nn.Linear(hidden, out_dim),
++    )
++
++
+ class BinaryHorizonHead(nn.Module):
+     def __init__(self, in_dim, hidden=128, dropout=0.2):
+         super().__init__()
+-        self.net = nn.Sequential(
+-            nn.Linear(in_dim, hidden),
+-            nn.GELU(),
+-            nn.Dropout(dropout),
+-            nn.Linear(hidden, 1),
+-        )
++        self.net = _mlp(in_dim, 1, hidden, dropout)
+ 
+     def forward(self, x):
+         return self.net(x).squeeze(-1)  # (B,) logit
+@@ -39,12 +63,7 @@ class DiscreteTimeSurvivalHead(nn.Module):
+     def __init__(self, in_dim, n_intervals, hidden=128, dropout=0.2):
+         super().__init__()
+         self.n_intervals = n_intervals
+-        self.net = nn.Sequential(
+-            nn.Linear(in_dim, hidden),
+-            nn.GELU(),
+-            nn.Dropout(dropout),
+-            nn.Linear(hidden, n_intervals),
+-        )
++        self.net = _mlp(in_dim, n_intervals, hidden, dropout)
+ 
+     def forward(self, x):
+         return self.net(x)  # (B, K) hazard logits
+@@ -56,3 +75,90 @@ class DiscreteTimeSurvivalHead(nn.Module):
+         surv = torch.cumprod(1.0 - h, dim=1)           # (B, K)
+         cif = 1.0 - surv
+         return surv, cif
++
++
++class CoxRiskHead(nn.Module):
++    """Outputs a scalar log-risk eta per patient (proportional hazards)."""
++
++    def __init__(self, in_dim, hidden=128, dropout=0.2):
++        super().__init__()
++        self.net = _mlp(in_dim, 1, hidden, dropout)
++
++    def forward(self, x):
++        return self.net(x).squeeze(-1)  # (B,) log-risk
++
++
++# --------------------------------------------------------------------------
++# Breslow baseline hazard for the Cox head
++# --------------------------------------------------------------------------
++class BreslowBaseline:
++    """Breslow estimator of the baseline cumulative hazard H0(t).
++
++    H0(t) = sum_{t_i <= t, event} d_i / sum_{j: T_j >= t_i} exp(eta_j)
++
++    Fitted on the (horizon-censored) training set with the trained network's
++    log-risks, then used to turn a log-risk into an absolute risk.
++    """
++
++    def __init__(self):
++        self.times_ = None
++        self.cumhaz_ = None
++
++    def fit(self, log_risk, times, events):
++        eta = np.asarray(log_risk, dtype=np.float64).ravel()
++        t = np.asarray(times, dtype=np.float64).ravel()
++        e = np.asarray(events).ravel().astype(bool)
++        eta = eta - eta.max()                       # numerical stability (cancels in ratio)
++        self._shift = float(np.asarray(log_risk).max()) if eta.size else 0.0
++        w = np.exp(eta)
++        order = np.argsort(-t, kind="stable")
++        t_s, w_s = t[order], w[order]
++        cum_w = np.cumsum(w_s)                      # risk-set sums, descending time
++        uniq = np.unique(t[e])
++        haz = []
++        for u in uniq:
++            d = int(((t == u) & e).sum())
++            # risk set = T >= u -> last index in descending order with t_s >= u
++            k = np.searchsorted(-t_s, -u, side="right") - 1
++            haz.append(d / cum_w[k])
++        self.times_ = uniq
++        self.cumhaz_ = np.cumsum(haz) if haz else np.array([])
++        return self
++
++    def cumulative_hazard(self, t):
++        t = np.atleast_1d(np.asarray(t, dtype=np.float64))
++        if self.times_ is None or self.times_.size == 0:
++            return np.zeros_like(t)
++        idx = np.searchsorted(self.times_, t, side="right") - 1
++        out = np.zeros_like(t)
++        out[idx >= 0] = self.cumhaz_[idx[idx >= 0]]
++        return out
++
++    def abs_risk(self, log_risk, t):
++        """CIF(t | x) = 1 - exp(-H0(t) * exp(eta)). Returns (N, len(t))."""
++        eta = np.asarray(log_risk, dtype=np.float64).ravel() - self._shift
++        H0 = self.cumulative_hazard(t)                          # (T,)
++        return 1.0 - np.exp(-np.outer(np.exp(eta), H0))
++
++    def state_dict(self):
++        return {"times": self.times_.tolist(), "cumhaz": self.cumhaz_.tolist(),
++                "shift": self._shift}
++
++    def load_state_dict(self, d):
++        self.times_ = np.asarray(d["times"], dtype=np.float64)
++        self.cumhaz_ = np.asarray(d["cumhaz"], dtype=np.float64)
++        self._shift = float(d.get("shift", 0.0))
++        return self
++
++
++def horizon_bin_index(horizon_days, cohort_horizon_days, n_intervals):
++    """Index of the survival bin whose right edge is the first >= ``horizon_days``.
++
++    Bins are equal-width over [0, cohort_horizon_days] (see build_cohort.py), so
++    CIF[:, k] is the risk by (k + 1) * cohort_horizon_days / n_intervals.
++    """
++    if horizon_days > cohort_horizon_days + 1e-9:
++        raise ValueError(f"eval horizon {horizon_days}d exceeds the cohort horizon "
++                         f"{cohort_horizon_days}d; the survival head cannot extrapolate")
++    k = int(np.ceil(horizon_days / cohort_horizon_days * n_intervals - 1e-9)) - 1
++    return int(min(max(k, 0), n_intervals - 1))
+diff --git a/notebooks/experiments.ipynb b/notebooks/experiments.ipynb
+index 44ed3c5..21805fa 100644
+--- a/notebooks/experiments.ipynb
++++ b/notebooks/experiments.ipynb
+@@ -4,9 +4,9 @@
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+-    "# Cardioformer-CKD \u2014 End-to-end experiments\n",
++    "# Cardioformer-CKD \u2014 End-to-end experiments (Thesis C)\n",
+     "\n",
+-    "Prognostic incident-CKD prediction from **MIMIC-IV + MIMIC-IV-ECG**, adapting the\n",
++    "Prognostic incident-CKD **risk prediction** from **MIMIC-IV + MIMIC-IV-ECG**, adapting the\n",
+     "Cardioformer ECG transformer. Run cells top to bottom. Requires credentialed\n",
+     "PhysioNet data (no data is shipped in this repo).\n"
+    ]
+@@ -157,9 +157,9 @@
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+-    "## 7. Ablations\n",
++    "## 7. Risk stratification (Thesis C)\n",
+     "\n",
+-    "Isolate each modality and compare the survival vs binary head."
++    "`test()` fits risk cut-points on the **validation** split and applies them to test. Default: median split -> low / high risk. Re-stratify a trained model without retraining:"
+    ]
+   },
+   {
+@@ -168,22 +168,21 @@
+    "execution_count": null,
+    "outputs": [],
+    "source": [
+-    "# ECG only\n",
+-    "!python run.py --config configs/ckd_prognosis.yaml \\\n",
+-    "  --setting ckd_2y_ecg_only --use_ecg 1 --use_ehr 0 --is_training 1\n",
+-    "# EHR only\n",
+-    "!python run.py --config configs/ckd_prognosis.yaml \\\n",
+-    "  --setting ckd_2y_ehr_only --use_ecg 0 --use_ehr 1 --is_training 1\n",
+-    "# Fixed-horizon binary head\n",
+-    "!python run.py --config configs/ckd_prognosis.yaml \\\n",
+-    "  --setting ckd_2y_binary --head binary --is_training 1"
++    "!python run.py --is_training 0 --config configs/ckd_prognosis.yaml \\\n",
++    "  --setting ckd_2y_survival_multimodal --risk_strat_quantiles 0.33,0.67 \\\n",
++    "  --results results/ckd_prognosis/tertiles\n",
++    "!python scripts/plot_results.py --run results/ckd_prognosis/ckd_2y_survival_multimodal\n",
++    "import json\n",
++    "print(json.dumps(json.load(open('results/ckd_prognosis/ckd_2y_survival_multimodal/risk_groups.json'))['groups'], indent=1))"
+    ]
+   },
+   {
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+-    "## 8. Inspect predicted cumulative-incidence curves (survival head)"
++    "## 8. Ablation study (Thesis C)\n",
++    "\n",
++    "One-factor-at-a-time ablations over modality, fusion, prognostic layer, ECG backbone components, EHR feature groups and training, 3 seeds each. Plan: `configs/ablations.yaml`."
+    ]
+   },
+   {
+@@ -192,19 +191,36 @@
+    "execution_count": null,
+    "outputs": [],
+    "source": [
+-    "import torch, json\n",
+-    "from types import SimpleNamespace\n",
+-    "from models.CardioformerCKD import CardioformerCKD\n",
+-    "# Load args used for the run (edit the setting as needed), rebuild model, load ckpt,\n",
+-    "# then: surv, cif = model.predict_cif(x_ecg=..., ehr=...)\n",
+-    "print('See exp/exp_ckd_prognosis.py validate() for the full eval loop.')"
++    "!python run_ablations.py --plan configs/ablations.yaml --dry_run | head\n",
++    "!python run_ablations.py --plan configs/ablations.yaml\n",
++    "!python collect_results.py --plan configs/ablations.yaml\n",
++    "!python scripts/plot_results.py --ablation results/ckd_prognosis/ablation_summary.csv"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 9. Inspect per-patient risk"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "import pandas as pd\n",
++    "pred = pd.read_csv('results/ckd_prognosis/ckd_2y_survival_multimodal/test_predictions.csv')\n",
++    "print(pred.groupby('risk_group')[['abs_risk_365d','abs_risk_730d','event_by_horizon']].mean())\n",
++    "pred.sort_values('risk_score', ascending=False).head()"
+    ]
+   },
+   {
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+-    "## 9. Collect test metrics"
++    "## 10. Pipeline check without MIMIC (synthetic data -- results meaningless)"
+    ]
+   },
+   {
+@@ -213,9 +229,9 @@
+    "execution_count": null,
+    "outputs": [],
+    "source": [
+-    "import json, glob\n",
+-    "for f in glob.glob('results/**/test_metrics.json', recursive=True):\n",
+-    "    print(f, json.load(open(f)))"
++    "!python scripts/make_synthetic_dataset.py --out_dir dataset/synthetic --n_subjects 400\n",
++    "!python run.py --config configs/ckd_prognosis.yaml --root_path dataset/synthetic \\\n",
++    "  --setting synthetic_check --train_epochs 2 --use_gpu 0 --num_workers 0"
+    ]
+   }
+  ],
+diff --git a/requirements.txt b/requirements.txt
+index 2467b0d..930153f 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -10,3 +10,4 @@ tqdm>=4.65
+ # optional: utils.metrics auto-detects lifelines and uses it for the C-index
+ # (the numpy fallback is vectorised and gives identical values, just slower)
+ # lifelines>=0.27
++matplotlib>=3.7   # optional: scripts/plot_results.py
+diff --git a/run.py b/run.py
+index 153bc06..370fa7a 100644
+--- a/run.py
++++ b/run.py
+@@ -9,7 +9,7 @@ python run.py \
+     --enc_in 12 --seq_len 250 \
+     --d_model 128 --n_heads 8 --e_layers 6 --d_ff 256 \
+     --patch_len_list 2,4,8,8,16,16,16,16,32 \
+-    --head survival --n_intervals 8 --fusion gated \
++    --head survival --n_intervals 8 --horizon_days 730 --fusion gated \
+     --use_ecg 1 --use_ehr 1 \
+     --batch_size 16 --learning_rate 1e-4 --train_epochs 20 --patience 5
+ 
+@@ -69,19 +69,61 @@ def build_parser():
+     p.add_argument("--resnet_hidden", type=int, default=64)
+     p.add_argument("--resnet_blocks", type=int, default=2)
+     p.add_argument("--cross_channel", type=str2bool, default=True)
++    p.add_argument("--patch_encoder", choices=["resnet", "linear"], default="resnet",
++                   help="patch -> token encoder: Cardioformer's 1-D ResNet (default) or a "
++                        "flatten+linear projection (ablation)")
++    p.add_argument("--inter_granularity", type=str2bool, default=True,
++                   help="stage-2 inter-granularity attention in every encoder layer "
++                        "(set 0 for the ablation)")
+ 
+     # multimodal / prognostic
+     p.add_argument("--use_ecg", type=str2bool, default=True)
+     p.add_argument("--use_ehr", type=str2bool, default=True)
+-    p.add_argument("--ehr_mode", choices=["mlp", "seq"], default="mlp")
++    p.add_argument("--ehr_mode", choices=["mlp", "seq", "identity"], default="mlp",
++                   help="'identity' feeds standardised features straight to the head "
++                        "(with --head cox --head_hidden 0 --use_ecg 0: linear Cox PH baseline)")
+     p.add_argument("--ehr_dropout", type=float, default=0.2)
++    p.add_argument("--ehr_drop_groups", default="",
++                   help="comma-separated EHR feature groups to remove (ablation): "
++                        "demographics, renal, labs_other, comorbidities, or raw column prefixes")
+     p.add_argument("--fusion", choices=["concat", "gated", "cross"], default="gated")
+     p.add_argument("--cross_attn_tokens", choices=["patches", "granularity"], default="patches",
+                    help="what cross-attention fusion attends over: the full multi-granularity patch "
+                         "sequence (default) or only the G pooled granularity summaries (legacy)")
+     p.add_argument("--d_fuse", type=int, default=256)
+-    p.add_argument("--head", choices=["binary", "survival"], default="survival")
++    # prognostic RISK layer (Thesis C)
++    p.add_argument("--head", choices=["survival", "cox", "binary"], default="survival",
++                   help="risk-prediction head: 'survival' discrete-time hazards (default), "
++                        "'cox' proportional-hazards log-risk + Breslow baseline, or "
++                        "'binary' fixed-horizon classifier (ablation baseline only)")
++    p.add_argument("--head_hidden", type=int, default=128, help="head MLP width; 0 = linear head")
++    p.add_argument("--head_dropout", type=float, default=0.2)
+     p.add_argument("--n_intervals", type=int, default=8, help="survival time bins over horizon")
++    p.add_argument("--horizon_days", type=float, default=730,
++                   help="prediction horizon; MUST match build_cohort --horizon_days. Events "
++                        "after it are censored at it for training and evaluation")
++    p.add_argument("--eval_horizons_days", default="365,730",
++                   help="horizons (days, <= horizon_days) at which absolute risk, td-AUROC "
++                        "and Brier are reported")
++
++    # risk stratification (high / low risk groups)
++    p.add_argument("--risk_strat_method", choices=["quantile", "absolute", "youden", "sensitivity"],
++                   default="quantile",
++                   help="how validation-set cut-points are chosen (see utils/risk_stratification.py)")
++    p.add_argument("--risk_strat_quantiles", default="0.5",
++                   help="quantile method: '0.5' = low/high median split, '0.33,0.67' = tertiles")
++    p.add_argument("--risk_strat_cutoffs", default="0.05,0.15",
++                   help="absolute method: predicted-risk cut-points at the strat horizon")
++    p.add_argument("--risk_strat_target_sens", type=float, default=0.8,
++                   help="sensitivity method: minimum validation sensitivity for 'high risk'")
++    p.add_argument("--risk_strat_horizon_days", type=float, default=None,
++                   help="horizon used for risk groups (default: --horizon_days)")
++
++    # evaluation
++    p.add_argument("--n_bootstrap", type=int, default=200,
++                   help="subject-level bootstrap replicates for test CIs (0 = off)")
++    p.add_argument("--calibration_bins", type=int, default=10)
++    p.add_argument("--early_stop_metric", choices=["c_index", "td_auroc"], default="c_index")
+ 
+     # optimisation
+     p.add_argument("--batch_size", type=int, default=16)
+diff --git a/run_ablations.py b/run_ablations.py
+new file mode 100644
+index 0000000..ded2903
+--- /dev/null
++++ b/run_ablations.py
+@@ -0,0 +1,148 @@
++"""Run the ablation study defined in an ablation plan YAML (configs/ablations.yaml).
++
++Each (variant, seed) is a separate ``run.py`` process -- fresh memory, fresh RNG
++-- with setting name ``abl_<variant>_s<seed>``. Any extra arguments after the
++known ones are forwarded to every run (e.g. data location, device, a shorter
++epoch budget for a smoke test):
++
++    python run_ablations.py --plan configs/ablations.yaml --groups modality \
++        -- --root_path dataset/ckd --use_gpu 1
++
++Variant overrides are applied *after* forwarded arguments, so a forwarded flag
++can never silently undo the component being ablated.
++"""
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++import time
++
++import yaml
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++
++
++def load_plan(path):
++    plan = yaml.safe_load(open(path))
++    for k in ("base_config", "variants", "groups"):
++        if k not in plan:
++            raise ValueError(f"ablation plan {path} is missing '{k}'")
++    plan.setdefault("reference", "full")
++    plan.setdefault("seeds", [41])
++    for g, vs in plan["groups"].items():
++        for v in vs:
++            if v not in plan["variants"]:
++                raise ValueError(f"group '{g}' lists unknown variant '{v}'")
++    return plan
++
++
++def selected_variants(plan, groups=None, variants=None):
++    if variants:
++        names = [v.strip() for v in variants.split(",") if v.strip()]
++    else:
++        gs = [g.strip() for g in groups.split(",")] if groups else list(plan["groups"])
++        names = []
++        for g in gs:
++            if g not in plan["groups"]:
++                raise ValueError(f"unknown group '{g}'; plan has {list(plan['groups'])}")
++            names += [v for v in plan["groups"][g] if v not in names]
++    for v in names:
++        if v not in plan["variants"]:
++            raise ValueError(f"unknown variant '{v}'")
++    return names
++
++
++def setting_name(variant, seed):
++    return f"abl_{variant}_s{seed}"
++
++
++def overrides_to_argv(overrides):
++    argv = []
++    for k, v in (overrides or {}).items():
++        if isinstance(v, bool):
++            v = "1" if v else "0"
++        elif isinstance(v, (list, tuple)):
++            v = ",".join(str(x) for x in v)
++        argv += [f"--{k}", str(v)]
++    return argv
++
++
++def build_argv(plan, variant, seed, forwarded):
++    return (["--config", plan["base_config"]] + list(forwarded)
++            + overrides_to_argv(plan["variants"][variant])
++            + ["--setting", setting_name(variant, seed), "--seed", str(seed),
++               "--is_training", "1"])
++
++
++def results_dir_for(argv):
++    import contextlib
++    import io
++    sys.path.insert(0, HERE)
++    from run import resolve_args
++    with contextlib.redirect_stdout(io.StringIO()):   # silence the [config] notices
++        a = resolve_args(argv)
++    return os.path.join(a.results, a.setting)
++
++
++def main(argv=None):
++    p = argparse.ArgumentParser(description="Run the CKD risk-model ablation study")
++    p.add_argument("--plan", default="configs/ablations.yaml")
++    p.add_argument("--groups", default=None, help="comma-separated groups (default: all)")
++    p.add_argument("--variants", default=None, help="comma-separated variants (overrides --groups)")
++    p.add_argument("--seeds", default=None, help="comma-separated seeds (default: from plan)")
++    p.add_argument("--skip_existing", type=int, default=1,
++                   help="skip runs whose test_metrics.json already exists")
++    p.add_argument("--dry_run", action="store_true")
++    argv = list(sys.argv[1:] if argv is None else argv)
++    if "--" in argv:
++        i = argv.index("--")
++        argv, forwarded = argv[:i], argv[i + 1:]
++    else:
++        forwarded = []
++    args, unknown = p.parse_known_args(argv)
++    forwarded = unknown + forwarded
++
++    plan = load_plan(args.plan)
++    seeds = ([int(s) for s in args.seeds.split(",")] if args.seeds else plan["seeds"])
++    names = selected_variants(plan, args.groups, args.variants)
++    print(f"[ablation] {len(names)} variants x {len(seeds)} seeds = {len(names) * len(seeds)} runs")
++
++    manifest = []
++    for v in names:
++        for s in seeds:
++            run_argv = build_argv(plan, v, s, forwarded)
++            out = results_dir_for(run_argv)
++            done = os.path.exists(os.path.join(out, "test_metrics.json"))
++            cmd = [sys.executable, os.path.join(HERE, "run.py")] + run_argv
++            entry = {"variant": v, "seed": s, "setting": setting_name(v, s),
++                     "results_dir": out, "cmd": " ".join(cmd)}
++            if args.dry_run:
++                print(entry["cmd"])
++            elif done and args.skip_existing:
++                print(f"[ablation] skip {entry['setting']} (results exist)")
++                entry["status"] = "skipped"
++            else:
++                print(f"[ablation] >>> {entry['setting']}")
++                t0 = time.time()
++                rc = subprocess.call(cmd, cwd=HERE)
++                entry["status"] = "ok" if rc == 0 else f"failed({rc})"
++                entry["seconds"] = round(time.time() - t0, 1)
++                if rc != 0:
++                    print(f"[ablation] !!! {entry['setting']} failed with exit code {rc}")
++            manifest.append(entry)
++
++    if not args.dry_run and manifest:
++        res_root = os.path.dirname(manifest[0]["results_dir"])
++        os.makedirs(res_root, exist_ok=True)
++        path = os.path.join(res_root, "ablation_manifest.json")
++        json.dump(manifest, open(path, "w"), indent=2)
++        n_fail = sum(1 for m in manifest if str(m.get("status", "")).startswith("failed"))
++        print(f"[ablation] manifest -> {path} ({n_fail} failed)")
++        return 1 if n_fail else 0
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/scripts/__init__.py b/scripts/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/scripts/evaluate_ckd.sh b/scripts/evaluate_ckd.sh
+index a96c10c..1510a7a 100644
+--- a/scripts/evaluate_ckd.sh
++++ b/scripts/evaluate_ckd.sh
+@@ -1,37 +1,29 @@
+ #!/usr/bin/env bash
+-# Evaluate a trained checkpoint and run modality ablations (ECG-only, EHR-only).
++# Evaluate the trained reference model and run the full ablation study (Thesis C).
+ #
+-# NOTE: --is_training 0 loads <checkpoints>/<setting>/checkpoint.pth and evaluates
+-# it. If that file does not exist the run now fails loudly instead of silently
+-# scoring a randomly initialised model.
++# --is_training 0 loads <checkpoints>/<setting>/checkpoint.pth (and, for the Cox
++# head, baseline_hazard.json) and fails loudly if it is missing.
+ #
+-# NOTE: CLI flags override the YAML (run.py::resolve_args). That is what makes the
+-# ablations below real ablations -- and what keeps each --setting writing to its
+-# own checkpoint/results directory instead of all of them clobbering the setting
+-# name declared inside ckd_prognosis.yaml.
++# CLI flags override the YAML (run.py::resolve_args); run_ablations.py relies on
++# this so every variant is a real ablation with its own checkpoint/results dir.
+ set -euo pipefail
+ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+ 
+-# evaluate the trained multimodal model (no training)
++# 1. evaluate the trained reference model: risk metrics + low/high risk groups
+ python run.py --is_training 0 --config configs/ckd_prognosis.yaml \
+   --setting ckd_2y_survival_multimodal
+ 
+-# ablation: ECG only
+-python run.py --is_training 1 --config configs/ckd_prognosis.yaml \
+-  --setting ckd_2y_ecg_only --use_ecg 1 --use_ehr 0
+-
+-# ablation: EHR only
+-python run.py --is_training 1 --config configs/ckd_prognosis.yaml \
+-  --setting ckd_2y_ehr_only --use_ecg 0 --use_ehr 1
+-
+-# ablation: fixed-horizon binary head instead of survival
+-python run.py --is_training 1 --config configs/ckd_prognosis.yaml \
+-  --setting ckd_2y_binary --head binary
++# 1b. same model, alternative stratifications (no retraining needed)
++python run.py --is_training 0 --config configs/ckd_prognosis.yaml \
++  --setting ckd_2y_survival_multimodal --results results/ckd_prognosis/tertiles \
++  --risk_strat_quantiles 0.33,0.67
++python run.py --is_training 0 --config configs/ckd_prognosis.yaml \
++  --setting ckd_2y_survival_multimodal --results results/ckd_prognosis/absolute \
++  --risk_strat_method absolute --risk_strat_cutoffs 0.05,0.15
+ 
+-# ablation: cross-attention fusion over the full patch sequence
+-python run.py --is_training 1 --config configs/ckd_prognosis.yaml \
+-  --setting ckd_2y_cross_patches --fusion cross --cross_attn_tokens patches
++python scripts/plot_results.py --run results/ckd_prognosis/ckd_2y_survival_multimodal
+ 
+-# ablation: cross-attention over pooled granularity tokens only (legacy behaviour)
+-python run.py --is_training 1 --config configs/ckd_prognosis.yaml \
+-  --setting ckd_2y_cross_granularity --fusion cross --cross_attn_tokens granularity
++# 2. ablation study (all groups x 3 seeds; see configs/ablations.yaml)
++python run_ablations.py --plan configs/ablations.yaml
++python collect_results.py --plan configs/ablations.yaml
++python scripts/plot_results.py --ablation results/ckd_prognosis/ablation_summary.csv
+diff --git a/scripts/make_synthetic_dataset.py b/scripts/make_synthetic_dataset.py
+new file mode 100644
+index 0000000..e048cba
+--- /dev/null
++++ b/scripts/make_synthetic_dataset.py
+@@ -0,0 +1,112 @@
++"""Generate a small SYNTHETIC dataset with the same schema as the real pipeline.
++
++!!! SYNTHETIC DATA -- FOR PIPELINE TESTING ONLY. NEVER REPORT RESULTS FROM IT. !!!
++
++It lets the full train -> test -> stratify -> ablate -> collect pipeline run
++end-to-end (CI, a laptop, or a quick check after a code change) without
++credentialed MIMIC-IV access. Event times are drawn from a proportional-hazards
++model whose risk depends on baseline eGFR, age, diabetes and an amplitude
++feature planted in the ECG, so a working model should reach a C-index clearly
++above 0.5 and the ECG/EHR ablations should move in the expected direction.
++
++Usage
++-----
++python scripts/make_synthetic_dataset.py --out_dir dataset/synthetic --n_subjects 600
++python run.py --config configs/ckd_prognosis.yaml --root_path dataset/synthetic ...
++"""
++
++import argparse
++import json
++import os
++
++import numpy as np
++import pandas as pd
++
++LABS = ["creatinine", "egfr", "bun", "potassium", "sodium", "bicarbonate",
++        "hemoglobin", "glucose", "albumin"]
++STATS = ["last", "min", "max", "mean", "slope", "n"]
++CMB = ["diabetes", "hypertension", "heart_failure", "ischemic_heart", "anemia"]
++
++
++def make(out_dir, n_subjects=600, studies_per_subject=(1, 3), horizon=730.0,
++         n_intervals=8, ecg_len=2500, n_leads=12, seed=0):
++    rng = np.random.default_rng(seed)
++    os.makedirs(os.path.join(out_dir, "ecg_npy"), exist_ok=True)
++    rows = []
++    study_id = 10_000_000
++    for sid in range(1, n_subjects + 1):
++        age = rng.uniform(30, 85)
++        female = rng.random() < 0.5
++        egfr = np.clip(rng.normal(85, 15), 60, 130)
++        diab = rng.random() < 0.25
++        htn = rng.random() < 0.4
++        ecg_marker = rng.normal()                     # latent "ECG" risk signal
++        lin = (-0.05 * (egfr - 85) + 0.03 * (age - 60) + 0.8 * diab + 0.4 * htn
++               + 0.6 * ecg_marker)
++        for _ in range(rng.integers(studies_per_subject[0], studies_per_subject[1] + 1)):
++            study_id += 1
++            # event time from an exponential PH model; censoring uniform on [60, 1800]
++            rate = 1 / 2500 * np.exp(lin)
++            t_event = rng.exponential(1 / rate)
++            t_cens = rng.uniform(60, 1800)
++            t = min(t_event, t_cens)
++            e = int(t_event <= t_cens)
++            t = max(t, 31.0)                          # respect the 30-day blanking gap
++            # ECG: noise + a sinusoid whose amplitude encodes the latent marker
++            tt = np.arange(ecg_len) / 250.0
++            sig = rng.normal(0, 1, (n_leads, ecg_len)).astype(np.float32)
++            sig += (1.0 + 0.8 * ecg_marker) * np.sin(2 * np.pi * 1.2 * tt)[None, :]
++            npy = os.path.join(out_dir, "ecg_npy", f"{study_id}.npy")
++            np.save(npy, sig.astype(np.float32))
++
++            label = int(e == 1 and t <= horizon)
++            eligible = int(label == 1 or t >= horizon)
++            edges = np.linspace(0, horizon, n_intervals + 1)
++            ebin = int(np.clip(np.digitize(min(t, horizon - 1e-6), edges) - 1, 0, n_intervals - 1))
++            r = {"subject_id": sid, "study_id": study_id, "ecg_npy": npy,
++                 "t0": pd.Timestamp("2150-01-01"), "label_binary": label,
++                 "eligible_binary": eligible, "event_time_days": float(t),
++                 "event_indicator": e, "event_bin": ebin,
++                 "age_at_t0": age, "sex_female": float(female)}
++            for lab in LABS:
++                base = {"egfr": egfr, "creatinine": 1.0 - (egfr - 85) / 100}.get(lab, rng.normal())
++                for s in STATS:
++                    r[f"{lab}_{s}"] = (float(rng.integers(1, 6)) if s == "n"
++                                       else float(base + rng.normal(0, 0.1)))
++            for c in CMB:
++                r[f"cmb_{c}"] = float({"diabetes": diab, "hypertension": htn}.get(c, rng.random() < 0.1))
++            rows.append(r)
++
++    df = pd.DataFrame(rows)
++    # subject-level split, stratified on any-positive
++    subj = df.groupby("subject_id")["label_binary"].max()
++    split = {}
++    for lab in (0, 1):
++        ids = subj[subj == lab].index.to_numpy()
++        rng.shuffle(ids)
++        n_tr, n_va = int(0.6 * len(ids)), int(0.2 * len(ids))
++        split.update({i: "train" for i in ids[:n_tr]})
++        split.update({i: "val" for i in ids[n_tr:n_tr + n_va]})
++        split.update({i: "test" for i in ids[n_tr + n_va:]})
++    df["split"] = df["subject_id"].map(split)
++    df.to_parquet(os.path.join(out_dir, "ckd_dataset_split.parquet"), index=False)
++    feat = ["age_at_t0", "sex_female"] + [f"{l}_{s}" for l in LABS for s in STATS] + \
++           [f"cmb_{c}" for c in CMB]
++    json.dump(feat, open(os.path.join(out_dir, "ehr_feature_columns.json"), "w"), indent=2)
++    with open(os.path.join(out_dir, "SYNTHETIC_DATA_README.txt"), "w") as f:
++        f.write("SYNTHETIC DATA generated by scripts/make_synthetic_dataset.py. "
++                "For pipeline testing only; results are meaningless.\n")
++    print(f"[synthetic] {len(df)} rows / {n_subjects} subjects -> {out_dir} "
++          f"(event rate by horizon {df['label_binary'].mean():.2f})")
++    return df
++
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
++    p.add_argument("--out_dir", default="dataset/synthetic")
++    p.add_argument("--n_subjects", type=int, default=600)
++    p.add_argument("--horizon_days", type=float, default=730)
++    p.add_argument("--n_intervals", type=int, default=8)
++    p.add_argument("--seed", type=int, default=0)
++    a = p.parse_args()
++    make(a.out_dir, a.n_subjects, horizon=a.horizon_days, n_intervals=a.n_intervals, seed=a.seed)
+diff --git a/scripts/plot_results.py b/scripts/plot_results.py
+new file mode 100644
+index 0000000..87c44f0
+--- /dev/null
++++ b/scripts/plot_results.py
+@@ -0,0 +1,123 @@
++"""Thesis figures from a finished run / ablation study (matplotlib).
++
++    python scripts/plot_results.py --run results/ckd_prognosis/ckd_2y_survival_multimodal
++    python scripts/plot_results.py --ablation results/ckd_prognosis/ablation_summary.csv
++
++Produces, in the run directory (or next to the summary):
++    km_by_risk_group.png   observed cumulative CKD incidence per risk group
++                           (Kaplan-Meier), with the log-rank p-value and HR
++    calibration.png        predicted vs observed risk by decile at the horizon
++    risk_distribution.png  predicted absolute risk, events vs non-events
++    ablation_<metric>.png  paired delta vs the reference model, per variant
++"""
++
++import argparse
++import csv
++import json
++import os
++
++import numpy as np
++
++
++def _read_csv(path):
++    with open(path) as f:
++        return list(csv.DictReader(f))
++
++
++def plot_run(run_dir):
++    import matplotlib
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++
++    groups = json.load(open(os.path.join(run_dir, "risk_groups.json")))
++    km = _read_csv(os.path.join(run_dir, "km_curves.csv"))
++    days = np.array([float(r["day"]) for r in km])
++    fig, ax = plt.subplots(figsize=(5.5, 4))
++    for name in [k for k in km[0] if k != "day"]:
++        n = next((g["n"] for g in groups["groups"] if g["group"] == name), None)
++        ax.step(days / 365.25, [float(r[name]) for r in km], where="post",
++                label=f"{name} risk (n={n})")
++    ax.set_xlabel("Years since index ECG")
++    ax.set_ylabel("Cumulative incidence of CKD")
++    p = groups.get("logrank_p", float("nan"))
++    ax.set_title(f"Log-rank p = {p:.2g};  HR high vs low = {groups['hr_high_vs_low']:.2f} "
++                 f"[{groups['hr_lo']:.2f}, {groups['hr_hi']:.2f}]", fontsize=9)
++    ax.legend(frameon=False)
++    fig.tight_layout()
++    fig.savefig(os.path.join(run_dir, "km_by_risk_group.png"), dpi=200)
++    plt.close(fig)
++
++    cal_path = os.path.join(run_dir, "calibration.csv")
++    if os.path.exists(cal_path):
++        cal = _read_csv(cal_path)
++        pr = np.array([float(r["mean_predicted"]) for r in cal])
++        ob = np.array([float(r["observed_km"]) for r in cal])
++        lo = np.array([float(r["observed_lo"]) for r in cal])
++        hi = np.array([float(r["observed_hi"]) for r in cal])
++        fig, ax = plt.subplots(figsize=(4.2, 4.2))
++        lim = max(pr.max(), hi.max()) * 1.05
++        ax.plot([0, lim], [0, lim], "k--", lw=1, label="perfect calibration")
++        ax.errorbar(pr, ob, yerr=[ob - lo, hi - ob], fmt="o", capsize=3, label="deciles")
++        ax.set_xlabel("Mean predicted risk")
++        ax.set_ylabel("Observed risk (Kaplan-Meier)")
++        ax.set_xlim(0, lim); ax.set_ylim(0, lim)
++        ax.legend(frameon=False, fontsize=8)
++        fig.tight_layout()
++        fig.savefig(os.path.join(run_dir, "calibration.png"), dpi=200)
++        plt.close(fig)
++
++    preds = _read_csv(os.path.join(run_dir, "test_predictions.csv"))
++    col = [c for c in preds[0] if c.startswith("abs_risk_")][-1]
++    r = np.array([float(x[col]) for x in preds])
++    ev = np.array([int(x["event_by_horizon"]) for x in preds]).astype(bool)
++    if np.isfinite(r).all():
++        fig, ax = plt.subplots(figsize=(5, 3.5))
++        bins = np.linspace(0, max(r.max(), 1e-3), 30)
++        ax.hist(r[~ev], bins=bins, alpha=0.6, density=True, label="no CKD by horizon")
++        ax.hist(r[ev], bins=bins, alpha=0.6, density=True, label="incident CKD by horizon")
++        for t in groups["thresholds"]["thresholds"] if groups["thresholds"]["on"] == "abs_risk" else []:
++            ax.axvline(t, color="k", ls=":")
++        ax.set_xlabel(f"Predicted {col.replace('abs_risk_', '')} risk")
++        ax.set_ylabel("Density")
++        ax.legend(frameon=False, fontsize=8)
++        fig.tight_layout()
++        fig.savefig(os.path.join(run_dir, "risk_distribution.png"), dpi=200)
++        plt.close(fig)
++    print(f"[plot] figures written to {run_dir}")
++
++
++def plot_ablation(summary_csv, metric="c_index"):
++    import matplotlib
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++
++    rows = _read_csv(summary_csv)
++    rows = [r for r in rows if np.isfinite(float(r[f"{metric}_delta"]))]
++    names = [r["variant"] for r in rows]
++    d = np.array([float(r[f"{metric}_delta"]) for r in rows])
++    sd = np.array([float(r[f"{metric}_delta_std"]) if r[f"{metric}_delta_std"] not in ("", "nan")
++                   else 0.0 for r in rows])
++    sd = np.nan_to_num(sd)
++    order = np.argsort(d)
++    fig, ax = plt.subplots(figsize=(6, 0.3 * len(rows) + 1))
++    ax.barh(np.array(names)[order], d[order], xerr=sd[order], capsize=2,
++            color=["C3" if x < 0 else "C2" for x in d[order]])
++    ax.axvline(0, color="k", lw=0.8)
++    ax.set_xlabel(f"Δ {metric} vs reference (paired over seeds)")
++    fig.tight_layout()
++    out = os.path.join(os.path.dirname(summary_csv), f"ablation_{metric}.png")
++    fig.savefig(out, dpi=200)
++    plt.close(fig)
++    print(f"[plot] {out}")
++
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--run", default=None, help="results/<...>/<setting> directory")
++    p.add_argument("--ablation", default=None, help="ablation_summary.csv")
++    p.add_argument("--metric", default="c_index")
++    a = p.parse_args()
++    if a.run:
++        plot_run(a.run)
++    if a.ablation:
++        plot_ablation(a.ablation, a.metric)
+diff --git a/scripts/train_ckd.sh b/scripts/train_ckd.sh
+index 839ba94..5c4e606 100644
+--- a/scripts/train_ckd.sh
++++ b/scripts/train_ckd.sh
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env bash
+-# Train CardioformerCKD for 2-year incident-CKD prognosis (multimodal, survival head).
++# Train CardioformerCKD for 2-year incident-CKD RISK prediction (multimodal, survival risk layer).
+ set -euo pipefail
+ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+ 
+@@ -8,5 +8,5 @@ python run.py \
+   --config configs/ckd_prognosis.yaml \
+   --setting ckd_2y_survival_multimodal \
+   --use_ecg 1 --use_ehr 1 \
+-  --head survival --n_intervals 8 --fusion gated \
++  --head survival --n_intervals 8 --horizon_days 730 --fusion gated \
+   --batch_size 16 --learning_rate 1e-4 --train_epochs 30 --patience 6
+diff --git a/tests/test_ablation_and_e2e.py b/tests/test_ablation_and_e2e.py
+new file mode 100644
+index 0000000..d4f076f
+--- /dev/null
++++ b/tests/test_ablation_and_e2e.py
+@@ -0,0 +1,88 @@
++"""Ablation plumbing + an end-to-end train/test run on synthetic data (CPU, ~10 s)."""
++
++import json
++import os
++
++import pytest
++import torch
++
++from run import resolve_args
++from run_ablations import build_argv, load_plan, overrides_to_argv, selected_variants
++
++PLAN = os.path.join(os.path.dirname(__file__), "..", "configs", "ablations.yaml")
++ROOT = os.path.join(os.path.dirname(__file__), "..")
++
++
++def test_plan_is_valid_and_every_group_contains_the_reference():
++    plan = load_plan(PLAN)
++    for g, vs in plan["groups"].items():
++        assert plan["reference"] in vs, f"group {g} has no reference model to compare to"
++
++
++def test_variant_overrides_become_real_cli_flags():
++    cwd = os.getcwd()
++    os.chdir(ROOT)
++    try:
++        plan = load_plan(PLAN)
++        a = resolve_args(build_argv(plan, "ecg_only", 42, ["--use_ehr", "1"]))
++        assert a.use_ehr is False                  # variant beats forwarded flag
++        assert a.setting == "abl_ecg_only_s42" and a.seed == 42
++        b = resolve_args(build_argv(plan, "linear_cox_ehr", 41, []))
++        assert (b.head, b.head_hidden, b.ehr_mode, b.use_ecg) == ("cox", 0, "identity", False)
++        c = resolve_args(build_argv(plan, "no_inter_granularity", 41, []))
++        assert c.inter_granularity is False
++    finally:
++        os.chdir(cwd)
++
++
++def test_overrides_to_argv_bools_and_lists():
++    assert overrides_to_argv({"augment": False, "x": [1, 2]}) == ["--augment", "0", "--x", "1,2"]
++
++
++def test_group_selection_deduplicates_reference():
++    plan = load_plan(PLAN)
++    names = selected_variants(plan, groups="modality,fusion")
++    assert names.count("full") == 1
++
++
++def test_backbone_ablation_switches_forward():
++    from models.CardioformerCKD import CardioformerCKD
++    from tests.test_model_forward import Cfg
++    for kw in ({"patch_encoder": "linear"}, {"inter_granularity": False},
++               {"cross_channel": False, "patch_encoder": "linear"}):
++        cfg = Cfg()
++        for k, v in kw.items():
++            setattr(cfg, k, v)
++        m = CardioformerCKD(cfg)
++        out = m(x_ecg=torch.randn(2, cfg.seq_len, cfg.enc_in), ehr=torch.randn(2, cfg.ehr_in_dim))
++        assert out.shape == (2, cfg.n_intervals)
++
++
++@pytest.mark.parametrize("head", ["survival", "cox"])
++def test_end_to_end_train_test_writes_risk_outputs(tmp_path, head):
++    from run import main
++    from scripts.make_synthetic_dataset import make
++    data = tmp_path / "syn"
++    make(str(data), n_subjects=80, seed=2)
++    argv = ["--root_path", str(data), "--setting", f"e2e_{head}", "--head", head,
++            "--checkpoints", str(tmp_path / "ck"), "--results", str(tmp_path / "res"),
++            "--use_gpu", "0", "--num_workers", "0", "--d_model", "16", "--n_heads", "2",
++            "--e_layers", "1", "--d_ff", "32", "--patch_len_list", "32",
++            "--resnet_hidden", "8", "--resnet_blocks", "1", "--d_fuse", "32",
++            "--train_epochs", "1", "--batch_size", "32", "--n_bootstrap", "5",
++            "--seq_len", "250"]
++    main(argv)
++    out = tmp_path / "res" / f"e2e_{head}"
++    for f in ("test_metrics.json", "test_predictions.csv", "val_predictions.csv",
++              "risk_groups.json", "km_curves.csv", "calibration.csv"):
++        assert (out / f).exists(), f
++    m = json.load(open(out / "test_metrics.json"))
++    for k in ("c_index", "td_auroc_365d", "td_auroc_730d", "brier_ipcw_730d",
++              "hr_high_vs_low", "observed_risk_low", "observed_risk_high", "c_index_ci95"):
++        assert k in m
++    g = json.load(open(out / "risk_groups.json"))
++    assert [x["group"] for x in g["groups"]] == ["low", "high"]
++    # eval-only reload reproduces the same numbers (checkpoint + scaler + baseline)
++    main(argv + ["--is_training", "0"])
++    m2 = json.load(open(out / "test_metrics.json"))
++    assert m2["c_index"] == m["c_index"] and m2["td_auroc_730d"] == m["td_auroc_730d"]
+diff --git a/tests/test_risk_layer.py b/tests/test_risk_layer.py
+new file mode 100644
+index 0000000..a070bba
+--- /dev/null
++++ b/tests/test_risk_layer.py
+@@ -0,0 +1,211 @@
++"""Thesis C: risk-prediction layer, survival utilities, stratification.
++
++Where lifelines is installed the numpy implementations are cross-checked
++against it; otherwise those assertions are skipped.
++"""
++
++import numpy as np
++import pytest
++import torch
++
++from models.heads import BreslowBaseline, CoxRiskHead, horizon_bin_index
++from utils.losses import cox_ph_loss
++from utils.metrics import bootstrap_ci, concordance_index
++from utils.risk_stratification import assign_groups, fit_thresholds, summarise_groups
++from utils.survival import (
++    administrative_censor, calibration_table, ipcw_brier_score, kaplan_meier, km_at,
++    logrank_test,
++)
++
++try:
++    import lifelines  # noqa: F401
++    HAS_LL = True
++except Exception:  # pragma: no cover
++    HAS_LL = False
++
++
++def _cohort(n=400, seed=0, ties=False):
++    rng = np.random.default_rng(seed)
++    x = rng.normal(size=(n, 2))
++    beta = np.array([0.9, -0.4])
++    t = rng.exponential(1 / np.exp(x @ beta)) * 300
++    c = rng.uniform(50, 900, n)
++    T = np.minimum(t, c)
++    if ties:
++        T = np.round(T / 30) * 30 + 1
++    E = (t <= c).astype(int)
++    return x, beta, T, E
++
++
++# ---- horizon censoring (the Thesis B labelling bug) ----------------------
++def test_events_after_horizon_are_censored_at_horizon():
++    t = np.array([100., 700., 800., 2000., 500.])
++    e = np.array([1, 1, 1, 1, 0])
++    th, eh = administrative_censor(t, e, 730)
++    assert list(eh) == [1, 1, 0, 0, 0]          # a year-5 onset is NOT a 2-year event
++    assert list(th) == [100., 700., 730., 730., 500.]
++
++
++def test_dataset_applies_horizon_censoring(tmp_path):
++    from data_provider.data_loader import MIMICIV_CKD_Dataset
++    from scripts.make_synthetic_dataset import make
++    make(str(tmp_path), n_subjects=40, seed=1)
++    ds = MIMICIV_CKD_Dataset(str(tmp_path), "train", horizon_days=730, use_ecg=False)
++    late = ds.df["event_time_days"] > 730
++    assert (ds.df.loc[late, "event_indicator_h"] == 0).all()
++    assert (ds.df.loc[late, "event_time_h"] == 730).all()
++    item = ds[0]
++    assert {"event_indicator_h", "event_time_h", "subject_id", "study_id"} <= set(item)
++
++
++def test_ehr_group_filter():
++    from data_provider.data_loader import filter_ehr_columns
++    cols = ["age_at_t0", "sex_female", "egfr_last", "creatinine_min", "bun_n",
++            "glucose_last", "cmb_diabetes"]
++    assert filter_ehr_columns(cols, "renal") == ["age_at_t0", "sex_female", "glucose_last",
++                                                 "cmb_diabetes"]
++    assert filter_ehr_columns(cols, "renal,labs_other,comorbidities") == ["age_at_t0", "sex_female"]
++    with pytest.raises(ValueError):
++        filter_ehr_columns(cols, "demographics,renal,labs_other,comorbidities")
++
++
++# ---- Kaplan-Meier and log-rank --------------------------------------------
++@pytest.mark.skipif(not HAS_LL, reason="lifelines not installed")
++def test_kaplan_meier_matches_lifelines():
++    from lifelines import KaplanMeierFitter
++    _, _, T, E = _cohort(ties=True)
++    km = kaplan_meier(T, E)
++    kmf = KaplanMeierFitter().fit(T, E)
++    q = np.linspace(0, 900, 37)
++    assert np.allclose(km_at(km, q), kmf.survival_function_at_times(q).values, atol=1e-10)
++
++
++@pytest.mark.skipif(not HAS_LL, reason="lifelines not installed")
++def test_logrank_matches_lifelines():
++    from lifelines.statistics import multivariate_logrank_test
++    x, _, T, E = _cohort(ties=True)
++    g = (x[:, 0] > 0).astype(int) + (x[:, 1] > 0.5).astype(int)   # 3 groups
++    ours = logrank_test(T, E, g)
++    ref = multivariate_logrank_test(T, g, E)
++    assert ours["statistic"] == pytest.approx(ref.test_statistic, rel=1e-8)
++    assert ours["p_value"] == pytest.approx(ref.p_value, rel=1e-6)
++
++
++# ---- Cox loss and Breslow baseline ----------------------------------------
++def test_cox_loss_equals_breslow_partial_likelihood_with_ties():
++    x, beta, T, E = _cohort(n=200, ties=True)
++    eta = x @ beta
++    manual = -np.mean([eta[i] - np.log(np.exp(eta[T >= T[i]]).sum())
++                       for i in range(len(T)) if E[i]]) * 1.0
++    ours = cox_ph_loss(torch.tensor(eta), torch.tensor(T), torch.tensor(E)).item()
++    assert ours == pytest.approx(manual, rel=1e-10)
++
++
++def test_cox_loss_lower_for_true_coefficients_and_zero_without_events():
++    x, beta, T, E = _cohort()
++    X, TT, EE = map(torch.tensor, (x, T, E))
++    good = cox_ph_loss(X @ torch.tensor(beta), TT, EE)
++    bad = cox_ph_loss(-(X @ torch.tensor(beta)), TT, EE)
++    assert good < bad
++    zero = cox_ph_loss(torch.randn(5, requires_grad=True), torch.rand(5), torch.zeros(5))
++    assert zero.item() == 0.0 and zero.requires_grad
++
++
++@pytest.mark.skipif(not HAS_LL, reason="lifelines not installed")
++def test_breslow_absolute_risk_matches_lifelines():
++    import pandas as pd
++    from lifelines import CoxPHFitter
++    x, _, T, E = _cohort(n=300)          # continuous times -> no ties
++    df = pd.DataFrame({"a": x[:, 0], "b": x[:, 1], "T": T, "E": E})
++    cph = CoxPHFitter(baseline_estimation_method="breslow").fit(df, "T", "E")
++    eta = x @ cph.params_.values
++    bl = BreslowBaseline().fit(eta, T, E)
++    # compare at observed event times: Breslow is a step function, whereas
++    # lifelines linearly interpolates between event times
++    ev = np.sort(T[E == 1])
++    times = [ev[10], ev[50], ev[100]]
++    ours = bl.abs_risk(eta, times)
++    ref = 1 - cph.predict_survival_function(df[["a", "b"]], times=times).values.T
++    assert np.allclose(ours, ref, atol=1e-6)
++    # round-trip through state_dict
++    bl2 = BreslowBaseline().load_state_dict(bl.state_dict())
++    assert np.allclose(bl2.abs_risk(eta, times), ours)
++
++
++def test_cox_head_and_linear_head_shapes():
++    h = CoxRiskHead(16)
++    assert h(torch.randn(4, 16)).shape == (4,)
++    lin = CoxRiskHead(16, hidden=0)
++    assert isinstance(lin.net, torch.nn.Linear)
++
++
++def test_horizon_bin_index():
++    assert horizon_bin_index(730, 730, 8) == 7
++    assert horizon_bin_index(365, 730, 8) == 3      # right edge of bin 3 = 365 d
++    with pytest.raises(ValueError):
++        horizon_bin_index(1000, 730, 8)
++
++
++# ---- calibration / Brier --------------------------------------------------
++def test_ipcw_brier_without_censoring_equals_plain_brier():
++    rng = np.random.default_rng(3)
++    T = rng.uniform(1, 1000, 500)
++    E = np.ones(500, dtype=int)                    # nobody censored
++    r = rng.random(500)
++    y = (T <= 730).astype(float)
++    assert ipcw_brier_score(T, E, r, 730) == pytest.approx(np.mean((r - y) ** 2), rel=1e-9)
++
++
++def test_ipcw_brier_zero_for_perfect_prediction():
++    _, _, T, E = _cohort()
++    y = ((E == 1) & (T <= 365)).astype(float)
++    assert ipcw_brier_score(T, E, y, 365) == pytest.approx(0.0, abs=1e-12)
++
++
++def test_calibration_table_counts():
++    _, _, T, E = _cohort()
++    r = np.random.default_rng(0).random(len(T))
++    rows, ece = calibration_table(T, E, r, 365, n_bins=10)
++    assert sum(row["n"] for row in rows) == len(T)
++    assert 0 <= ece <= 1
++
++
++# ---- stratification --------------------------------------------------------
++def test_quantile_thresholds_come_from_validation_and_split_test():
++    val = np.linspace(0, 1, 101)
++    th = fit_thresholds(val, "quantile", quantiles="0.5")
++    assert th["thresholds"] == [pytest.approx(0.5)]
++    g = assign_groups(np.array([0.1, 0.49, 0.51, 0.9]), th["thresholds"])
++    assert list(g) == [0, 0, 1, 1]
++    th3 = fit_thresholds(val, "quantile", quantiles="0.33,0.67")
++    assert list(assign_groups(np.array([0.1, 0.5, 0.9]), th3["thresholds"])) == [0, 1, 2]
++
++
++def test_youden_and_sensitivity_thresholds():
++    s = np.array([0.1, 0.2, 0.3, 0.6, 0.7, 0.8])
++    y = np.array([0, 0, 0, 1, 1, 1])
++    th = fit_thresholds(s, "youden", val_label=y)
++    assert 0.3 < th["thresholds"][0] <= 0.6 and th["val_sensitivity"] == 1.0
++    ths = fit_thresholds(s, "sensitivity", val_label=y, target_sensitivity=0.66)
++    assert ths["val_sensitivity"] >= 0.66
++
++
++def test_summarise_groups_separates_high_and_low_risk():
++    x, _, T, E = _cohort(n=600)
++    T, E = administrative_censor(T, E, 730)
++    risk = x[:, 0]                                     # true dominant risk factor
++    g = assign_groups(risk, [np.median(risk)])
++    s = summarise_groups(T, E, g, horizon=730)
++    low, high = s["groups"]
++    assert high["observed_risk_km"] > low["observed_risk_km"]
++    assert s["logrank_p"] < 1e-3 and s["hr_high_vs_low"] > 1.5
++
++
++def test_bootstrap_ci_brackets_point_estimate():
++    _, beta, T, E = _cohort()
++    x, _, _, _ = _cohort()
++    r = x @ beta
++    ids = np.arange(len(T)) // 2                        # 2 rows per "subject"
++    lo, hi = bootstrap_ci(lambda ix: concordance_index(T[ix], r[ix], E[ix]), ids, n_boot=50)
++    c = concordance_index(T, r, E)
++    assert lo < c < hi
+diff --git a/utils/losses.py b/utils/losses.py
+index 85cfe49..424c12a 100644
+--- a/utils/losses.py
++++ b/utils/losses.py
+@@ -3,6 +3,7 @@
+ * ``focal_bce`` — class-imbalance-aware loss for the fixed-horizon binary head.
+ * ``discrete_time_nll`` — negative log-likelihood for the discrete-time survival
+   head, correctly handling right-censoring.
++* ``cox_ph_loss`` — Cox partial likelihood (Breslow ties) for the Cox risk head.
+ """
+ 
+ import torch
+@@ -55,3 +56,31 @@ def discrete_time_nll(hazard_logits, event_bin, event_indicator):
+ 
+     nll = -(log_surv + log_event)
+     return nll.mean()
++
++
++def cox_ph_loss(log_risk, times, events):
++    """Negative Cox partial log-likelihood with Breslow handling of ties.
++
++    loss = - (1 / n_events) * sum_{i: event} [ eta_i - log sum_{j: T_j >= T_i} exp(eta_j) ]
++
++    The risk set is computed over the mini-batch (as in DeepSurv), so the loss
++    is only an approximation of the full-cohort partial likelihood; larger
++    batches give a better approximation. Tied event times share the same risk
++    set (Breslow). Returns 0 (with a graph) when the batch has no events.
++    """
++    eta = log_risk.reshape(-1)
++    t = times.reshape(-1).float()
++    e = events.reshape(-1).float()
++    if e.sum() <= 0:
++        return eta.sum() * 0.0
++    order = torch.argsort(t, descending=True)
++    eta_s, t_s, e_s = eta[order], t[order], e[order]
++    lcse = torch.logcumsumexp(eta_s, dim=0)          # log sum_{j <= i in desc order}
++    # Breslow ties: everyone tied at t_i is in the risk set -> use the value at
++    # the LAST position of each tie group (descending order keeps ties contiguous).
++    _, counts = torch.unique_consecutive(t_s, return_counts=True)
++    ends = torch.cumsum(counts, 0) - 1
++    group_end = torch.repeat_interleave(ends, counts)
++    log_risk_set = lcse[group_end]
++    ll = (eta_s - log_risk_set) * e_s
++    return -ll.sum() / e_s.sum()
+diff --git a/utils/metrics.py b/utils/metrics.py
+index d522fde..96581fe 100644
+--- a/utils/metrics.py
++++ b/utils/metrics.py
+@@ -7,6 +7,10 @@ AUROC at a chosen horizon bin, and a simple Brier-style calibration error).
+ scikit-learn is used where available; lightweight fallbacks are provided so the
+ core training loop never hard-fails on a metric. ``lifelines`` is used for the
+ C-index when installed, otherwise a vectorised numpy implementation is used.
++
++Thesis C adds ``bootstrap_ci`` (subject-level bootstrap). Survival-specific
++utilities (Kaplan-Meier, log-rank, IPCW Brier, calibration) live in
++``utils/survival.py``.
+ """
+ 
+ import numpy as np
+@@ -129,3 +133,27 @@ def brier_score(y_true, y_prob):
+     y_true = np.asarray(y_true).ravel()
+     y_prob = np.asarray(y_prob).ravel()
+     return float(np.mean((y_prob - y_true) ** 2))
++
++
++def bootstrap_ci(metric_fn, cluster_ids, n_boot=200, alpha=0.05, seed=41):
++    """Percentile bootstrap CI, resampling *subjects* (clusters) with replacement.
++
++    With ``--policy all`` one subject can contribute several ECG studies, so
++    resampling rows would understate the variance. ``metric_fn(indices)`` must
++    return the metric on the given row indices; NaN replicates are dropped.
++    """
++    ids = np.asarray(cluster_ids).ravel()
++    uniq, inv = np.unique(ids, return_inverse=True)
++    order = np.argsort(inv, kind="stable")
++    rows_of = np.split(order, np.cumsum(np.bincount(inv, minlength=uniq.size))[:-1])
++    rng = np.random.default_rng(seed)
++    vals = []
++    for _ in range(int(n_boot)):
++        pick = rng.integers(0, uniq.size, uniq.size)
++        ix = np.concatenate([rows_of[k] for k in pick])
++        v = metric_fn(ix)
++        if v is not None and np.isfinite(v):
++            vals.append(v)
++    if not vals:
++        return float("nan"), float("nan")
++    return (float(np.quantile(vals, alpha / 2)), float(np.quantile(vals, 1 - alpha / 2)))
+diff --git a/utils/risk_stratification.py b/utils/risk_stratification.py
+new file mode 100644
+index 0000000..4972a4d
+--- /dev/null
++++ b/utils/risk_stratification.py
+@@ -0,0 +1,175 @@
++"""Risk stratification: turn a continuous predicted risk into patient risk groups.
++
++The prognostic layer outputs a *continuous* risk for every patient (a predicted
++probability of incident CKD by the horizon, and a ranking score). Clinically the
++question is usually "who is high risk and who is low risk?". This module answers
++it without leaking test information:
++
++1. **Thresholds are fitted on the validation split only** (``fit_thresholds``)
++   and then frozen.
++2. The frozen thresholds are applied to the test split (``assign_groups``).
++3. Each group is summarised with the *observed* (Kaplan-Meier) CKD incidence,
++   and the groups are compared with a log-rank test and a hazard ratio
++   (``summarise_groups``).
++
++Supported methods (``--risk_strat_method``)
++-------------------------------------------
++quantile     cut the validation risk distribution at the given quantiles.
++             ``--risk_strat_quantiles 0.5``      -> low / high (median split)
++             ``--risk_strat_quantiles 0.33,0.67`` -> low / intermediate / high
++             ``--risk_strat_quantiles 0.8``      -> top-20% flagged as high risk
++absolute     cut predicted *absolute* risk at the horizon at fixed probabilities,
++             e.g. ``--risk_strat_cutoffs 0.05,0.15`` (clinically interpretable:
++             "<5% two-year risk is low").
++youden       one cut-point on validation maximising sensitivity + specificity - 1
++             for "CKD by the horizon" among horizon-eligible patients.
++sensitivity  the highest cut-point that still reaches ``--risk_strat_target_sens``
++             sensitivity on validation (screening-style operating point).
++"""
++
++import numpy as np
++
++from utils.survival import (
++    cox_hazard_ratio, kaplan_meier, km_at, km_risk_at, logrank_test,
++)
++
++METHODS = ("quantile", "absolute", "youden", "sensitivity")
++
++
++def _parse_floats(s):
++    if s is None:
++        return []
++    if isinstance(s, (list, tuple)):
++        return [float(x) for x in s]
++    return [float(x) for x in str(s).split(",") if str(x).strip()]
++
++
++def group_names(n_groups):
++    if n_groups == 2:
++        return ["low", "high"]
++    if n_groups == 3:
++        return ["low", "intermediate", "high"]
++    return [f"Q{i + 1}" for i in range(n_groups)]
++
++
++def fit_thresholds(val_score, method="quantile", quantiles="0.5", cutoffs="0.05,0.15",
++                   val_label=None, val_eligible=None, target_sensitivity=0.8,
++                   val_abs_risk=None):
++    """Fit cut-points on the *validation* split.
++
++    Returns dict(method, thresholds, on) where ``on`` says which array the
++    thresholds apply to: 'score' (ranking score) or 'abs_risk' (absolute risk at
++    the stratification horizon).
++    """
++    s = np.asarray(val_score, dtype=float).ravel()
++    if method not in METHODS:
++        raise ValueError(f"unknown risk_strat_method {method!r}; choose from {METHODS}")
++
++    if method == "quantile":
++        qs = sorted(_parse_floats(quantiles))
++        if not qs or any(q <= 0 or q >= 1 for q in qs):
++            raise ValueError("risk_strat_quantiles must be in (0, 1)")
++        th = np.quantile(s, qs).tolist()
++        return {"method": method, "thresholds": th, "on": "score", "quantiles": qs}
++
++    if method == "absolute":
++        cs = sorted(_parse_floats(cutoffs))
++        if val_abs_risk is None:
++            raise ValueError("absolute stratification needs absolute risk at the horizon")
++        return {"method": method, "thresholds": cs, "on": "abs_risk"}
++
++    # label-based single cut-points ----------------------------------------
++    if val_label is None:
++        raise ValueError(f"{method} stratification needs validation labels")
++    y = np.asarray(val_label).ravel().astype(int)
++    m = np.ones_like(y, dtype=bool) if val_eligible is None else np.asarray(val_eligible).ravel().astype(bool)
++    s_m, y_m = s[m], y[m]
++    if y_m.min(initial=1) == y_m.max(initial=0):
++        # only one class present -> fall back to the median
++        return {"method": "quantile", "thresholds": [float(np.median(s))], "on": "score",
++                "note": f"{method} fell back to median split (single class on validation)"}
++    cands = np.unique(s_m)
++    P, N = (y_m == 1).sum(), (y_m == 0).sum()
++    # vectorised sens/spec for "score >= c is high risk"
++    order = np.sort(s_m[y_m == 1]); order_n = np.sort(s_m[y_m == 0])
++    sens = 1 - np.searchsorted(order, cands, side="left") / P
++    spec = np.searchsorted(order_n, cands, side="left") / N
++    if method == "youden":
++        j = sens + spec - 1
++        c = float(cands[int(np.argmax(j))])
++        return {"method": method, "thresholds": [c], "on": "score",
++                "val_sensitivity": float(sens[np.argmax(j)]),
++                "val_specificity": float(spec[np.argmax(j)])}
++    # sensitivity target: largest threshold still achieving the target
++    ok = np.where(sens >= target_sensitivity)[0]
++    i = int(ok.max()) if ok.size else 0
++    return {"method": method, "thresholds": [float(cands[i])], "on": "score",
++            "val_sensitivity": float(sens[i]), "val_specificity": float(spec[i]),
++            "target_sensitivity": float(target_sensitivity)}
++
++
++def assign_groups(values, thresholds):
++    """Group index 0..len(thresholds): 0 = lowest risk. ``values >= t`` moves up."""
++    v = np.asarray(values, dtype=float).ravel()
++    return np.searchsorted(np.asarray(sorted(thresholds)), v, side="right").astype(int)
++
++
++def summarise_groups(times, events, groups, abs_risk=None, horizon=730.0, names=None,
++                     km_grid=None):
++    """Per-group observed vs predicted risk, log-rank test and HR (top vs bottom).
++
++    ``times``/``events`` should already be administratively censored at the
++    horizon (see utils.survival.administrative_censor).
++    """
++    t = np.asarray(times, dtype=float).ravel()
++    e = np.asarray(events).ravel().astype(int)
++    g = np.asarray(groups).ravel().astype(int)
++    n_groups = int(max(g.max(initial=0) + 1, len(names) if names else 0))
++    names = names or group_names(n_groups)
++
++    rows = []
++    for k in range(n_groups):
++        m = g == k
++        obs, lo, hi = km_risk_at(t[m], e[m], horizon) if m.any() else (np.nan,) * 3
++        rows.append({
++            "group": names[k] if k < len(names) else f"G{k}",
++            "n": int(m.sum()),
++            "fraction": float(m.mean()) if m.size else float("nan"),
++            "n_events_by_horizon": int((e[m] == 1).sum()),
++            "observed_risk_km": float(obs), "observed_risk_lo": float(lo),
++            "observed_risk_hi": float(hi),
++            "mean_predicted_risk": (float(np.mean(np.asarray(abs_risk)[m]))
++                                    if abs_risk is not None and m.any() else float("nan")),
++        })
++
++    present = np.unique(g)
++    lr = logrank_test(t, e, g) if present.size >= 2 else {"statistic": np.nan, "p_value": np.nan, "dof": 0}
++    top, bottom = int(present.max()), int(present.min())
++    m2 = (g == top) | (g == bottom)
++    hr, hr_lo, hr_hi, hr_method = (cox_hazard_ratio(t[m2], e[m2], (g[m2] == top))
++                                   if present.size >= 2 else (np.nan,) * 3 + ("n/a",))
++
++    # KM curves per group on a common grid, for plotting
++    grid = np.asarray(km_grid if km_grid is not None else np.linspace(0, horizon, 49))
++    curves = {}
++    for k in range(n_groups):
++        m = g == k
++        if m.any():
++            km = kaplan_meier(t[m], e[m])
++            curves[rows[k]["group"]] = (1 - km_at(km, grid)).tolist()   # cumulative incidence
++
++    top_obs = rows[top]["observed_risk_km"]
++    bot_obs = rows[bottom]["observed_risk_km"]
++    return {
++        "groups": rows,
++        "logrank_statistic": float(lr["statistic"]),
++        "logrank_dof": int(lr["dof"]),
++        "logrank_p": float(lr["p_value"]),
++        "hr_high_vs_low": float(hr), "hr_lo": float(hr_lo), "hr_hi": float(hr_hi),
++        "hr_method": hr_method,
++        "observed_risk_ratio_high_vs_low": (float(top_obs / bot_obs)
++                                            if bot_obs and np.isfinite(bot_obs) and bot_obs > 0
++                                            else float("nan")),
++        "km_grid_days": grid.tolist(),
++        "km_cumulative_incidence": curves,
++    }
+diff --git a/utils/survival.py b/utils/survival.py
+new file mode 100644
+index 0000000..b670e42
+--- /dev/null
++++ b/utils/survival.py
+@@ -0,0 +1,268 @@
++"""Survival-analysis utilities for the risk-prediction layer (Thesis C).
++
++Everything here is plain numpy (scipy only for the chi-square tail), so it is
++unit-testable without torch and without lifelines. When lifelines *is* installed
++the tests cross-check these implementations against it.
++
++Contents
++--------
++administrative_censor   truncate follow-up at the prediction horizon
++kaplan_meier            product-limit estimator with Greenwood variance
++km_at                   step-function lookup of a KM curve at arbitrary times
++logrank_test            k-group log-rank test (chi-square, k-1 dof)
++hazard_ratio_logrank    HR of one group vs another from log-rank O/E
++ipcw_brier_score        Graf et al. (1999) Brier score at a horizon with
++                        inverse-probability-of-censoring weights
++calibration_table       predicted vs KM-observed risk by risk quantile
++"""
++
++import numpy as np
++
++try:
++    from scipy.stats import chi2 as _chi2
++    _HAS_SCIPY = True
++except Exception:  # pragma: no cover
++    _HAS_SCIPY = False
++
++
++def _as1d(x, dtype=np.float64):
++    return np.asarray(x, dtype=dtype).ravel()
++
++
++# --------------------------------------------------------------------------
++# censoring at the horizon
++# --------------------------------------------------------------------------
++def administrative_censor(times, events, horizon):
++    """Censor everyone still event-free at ``horizon``.
++
++    An event observed *after* the horizon is not an event within the prediction
++    window: the patient is known to be event-free up to the horizon, so they are
++    censored there. Without this, a CKD onset at year 5 is counted as a year-2
++    event by any model that bins time over [0, horizon].
++    """
++    t = _as1d(times)
++    e = _as1d(events).astype(bool)
++    after = t > horizon
++    t_h = np.where(after, float(horizon), t)
++    e_h = e & ~after
++    return t_h, e_h.astype(int)
++
++
++# --------------------------------------------------------------------------
++# Kaplan-Meier
++# --------------------------------------------------------------------------
++def kaplan_meier(times, events):
++    """Kaplan-Meier survival estimate.
++
++    Returns dict with arrays over the distinct event/censor times:
++        time, n_at_risk, n_events, surv, var (Greenwood variance of S).
++    ``surv`` is the value *after* the drop at ``time`` (right-continuous).
++    """
++    t = _as1d(times)
++    e = _as1d(events).astype(bool)
++    if t.size == 0:
++        return {"time": np.array([]), "n_at_risk": np.array([]),
++                "n_events": np.array([]), "surv": np.array([]), "var": np.array([])}
++    uniq = np.unique(t)
++    # at-risk: T >= u ; events: T == u & e
++    order = np.sort(t)
++    n_at_risk = t.size - np.searchsorted(order, uniq, side="left")
++    ev_times = np.sort(t[e])
++    n_events = (np.searchsorted(ev_times, uniq, side="right")
++                - np.searchsorted(ev_times, uniq, side="left"))
++    with np.errstate(divide="ignore", invalid="ignore"):
++        step = 1.0 - n_events / np.maximum(n_at_risk, 1)
++        surv = np.cumprod(step)
++        gw_terms = np.where(
++            (n_at_risk - n_events) > 0,
++            n_events / (n_at_risk * np.maximum(n_at_risk - n_events, 1)),
++            0.0,
++        )
++    var = surv ** 2 * np.cumsum(gw_terms)
++    return {"time": uniq, "n_at_risk": n_at_risk, "n_events": n_events,
++            "surv": surv, "var": var}
++
++
++def km_at(km, query_times, left_limit=False):
++    """Evaluate a KM curve at ``query_times``.
++
++    ``left_limit=True`` returns S(t-) (the value just *before* t), which is what
++    the IPCW weights need for event times.
++    """
++    q = _as1d(query_times)
++    if km["time"].size == 0:
++        return np.ones_like(q)
++    side = "left" if left_limit else "right"
++    idx = np.searchsorted(km["time"], q, side=side) - 1
++    out = np.ones_like(q)
++    ok = idx >= 0
++    out[ok] = km["surv"][idx[ok]]
++    return out
++
++
++def km_risk_at(times, events, horizon):
++    """Observed cumulative incidence 1 - S(horizon) with a 95% CI (log-log)."""
++    km = kaplan_meier(times, events)
++    if km["time"].size == 0:
++        return float("nan"), float("nan"), float("nan")
++    s = float(km_at(km, [horizon])[0])
++    idx = np.searchsorted(km["time"], horizon, side="right") - 1
++    var = float(km["var"][idx]) if idx >= 0 else 0.0
++    if s <= 0 or s >= 1 or var <= 0:
++        return 1 - s, 1 - s, 1 - s
++    # log(-log) transformed CI for S, mapped to risk = 1 - S
++    se = np.sqrt(var) / (s * abs(np.log(s)))
++    lo_s = s ** np.exp(1.96 * se)
++    hi_s = s ** np.exp(-1.96 * se)
++    return 1 - s, 1 - hi_s, 1 - lo_s
++
++
++# --------------------------------------------------------------------------
++# log-rank test and hazard ratio
++# --------------------------------------------------------------------------
++def logrank_test(times, events, groups):
++    """k-sample log-rank test.
++
++    Returns dict(statistic, dof, p_value, observed, expected) where observed and
++    expected are per-group event counts (sorted by group label).
++    """
++    t = _as1d(times)
++    e = _as1d(events).astype(bool)
++    g = np.asarray(groups).ravel()
++    labels = np.unique(g)
++    k = labels.size
++    if k < 2 or not e.any():
++        return {"statistic": float("nan"), "dof": max(k - 1, 0), "p_value": float("nan"),
++                "observed": [0.0] * k, "expected": [0.0] * k, "groups": labels.tolist()}
++
++    ev_times = np.unique(t[e])
++    O = np.zeros(k)
++    E = np.zeros(k)
++    V = np.zeros((k, k))
++    for u in ev_times:
++        at_risk = t >= u
++        d_mask = (t == u) & e
++        n = at_risk.sum()
++        d = d_mask.sum()
++        n_g = np.array([(at_risk & (g == lab)).sum() for lab in labels], dtype=float)
++        d_g = np.array([(d_mask & (g == lab)).sum() for lab in labels], dtype=float)
++        O += d_g
++        E += d * n_g / n
++        if n > 1:
++            c = d * (n - d) / (n ** 2 * (n - 1))
++            V += c * (np.diag(n_g) * n - np.outer(n_g, n_g))
++    # drop last group to get a non-singular (k-1)x(k-1) system
++    diff = (O - E)[:-1]
++    Vr = V[:-1, :-1]
++    try:
++        stat = float(diff @ np.linalg.solve(Vr, diff))
++    except np.linalg.LinAlgError:
++        stat = float(diff @ np.linalg.pinv(Vr) @ diff)
++    dof = k - 1
++    p = float(_chi2.sf(stat, dof)) if _HAS_SCIPY else float("nan")
++    return {"statistic": stat, "dof": dof, "p_value": p,
++            "observed": O.tolist(), "expected": E.tolist(), "groups": labels.tolist()}
++
++
++def hazard_ratio_logrank(times, events, groups, group_a, group_b):
++    """Hazard ratio of ``group_a`` relative to ``group_b`` via log-rank O/E.
++
++    HR = (O_a / E_a) / (O_b / E_b), computed on the two groups only, with an
++    approximate 95% CI from Var(log HR) = 1/E_a + 1/E_b. This is the classical
++    Peto estimate; for publication-grade numbers prefer a Cox fit (lifelines),
++    which ``cox_hazard_ratio`` uses when available.
++    """
++    g = np.asarray(groups).ravel()
++    m = (g == group_a) | (g == group_b)
++    res = logrank_test(_as1d(times)[m], _as1d(events)[m], g[m])
++    labels = res["groups"]
++    if len(labels) < 2:
++        return float("nan"), float("nan"), float("nan")
++    ia, ib = labels.index(group_a), labels.index(group_b)
++    O, E = np.array(res["observed"]), np.array(res["expected"])
++    if min(O[ia], O[ib], E[ia], E[ib]) <= 0:
++        return float("nan"), float("nan"), float("nan")
++    hr = (O[ia] / E[ia]) / (O[ib] / E[ib])
++    se = np.sqrt(1.0 / E[ia] + 1.0 / E[ib])
++    return float(hr), float(hr * np.exp(-1.96 * se)), float(hr * np.exp(1.96 * se))
++
++
++def cox_hazard_ratio(times, events, is_group_a):
++    """HR (group A vs rest) from a univariable Cox model if lifelines is installed,
++    else the log-rank estimate. Returns (hr, lo, hi, method)."""
++    t = _as1d(times)
++    e = _as1d(events).astype(int)
++    a = np.asarray(is_group_a).astype(int).ravel()
++    try:
++        import pandas as pd
++        from lifelines import CoxPHFitter
++        df = pd.DataFrame({"T": t, "E": e, "A": a})
++        cph = CoxPHFitter().fit(df, "T", "E")
++        s = cph.summary.loc["A"]
++        return (float(s["exp(coef)"]), float(s["exp(coef) lower 95%"]),
++                float(s["exp(coef) upper 95%"]), "cox")
++    except Exception:
++        hr, lo, hi = hazard_ratio_logrank(t, e, a, 1, 0)
++        return hr, lo, hi, "logrank"
++
++
++# --------------------------------------------------------------------------
++# calibration / accuracy of absolute risk
++# --------------------------------------------------------------------------
++def ipcw_brier_score(times, events, risk_at_h, horizon, train_times=None, train_events=None):
++    """Brier score of predicted cumulative incidence at ``horizon`` with IPCW.
++
++    Graf et al. (1999): subjects censored before the horizon get weight 0 and
++    the others are re-weighted by 1/G, where G is the KM estimate of the
++    *censoring* distribution (fit on ``train_*`` if given, else on the data).
++
++        event by h      : (1 - r_i)^2 / G(T_i-)
++        survived past h :      r_i ^2 / G(h)
++        censored before : 0
++    """
++    t = _as1d(times)
++    e = _as1d(events).astype(bool)
++    r = _as1d(risk_at_h)
++    ct = _as1d(train_times) if train_times is not None else t
++    ce = _as1d(train_events).astype(bool) if train_events is not None else e
++    G = kaplan_meier(ct, ~ce)                         # censoring "survival"
++    g_ti = np.clip(km_at(G, t, left_limit=True), 1e-8, None)
++    g_h = max(float(km_at(G, [horizon])[0]), 1e-8)
++
++    case = e & (t <= horizon)
++    ctrl = t > horizon
++    contrib = np.zeros_like(r)
++    contrib[case] = (1 - r[case]) ** 2 / g_ti[case]
++    contrib[ctrl] = r[ctrl] ** 2 / g_h
++    return float(contrib.mean()) if contrib.size else float("nan")
++
++
++def calibration_table(times, events, risk_at_h, horizon, n_bins=10):
++    """Mean predicted risk vs KM-observed risk within quantile bins of risk.
++
++    Returns a list of dicts (one per bin) and the expected-calibration error
++    ``ece = sum_b (n_b / N) * |pred_b - obs_b|``. The KM estimate inside each
++    bin accounts for censoring, unlike a naive event fraction.
++    """
++    t = _as1d(times)
++    e = _as1d(events).astype(bool)
++    r = _as1d(risk_at_h)
++    n = r.size
++    if n == 0:
++        return [], float("nan")
++    n_bins = int(max(1, min(n_bins, n)))
++    edges = np.quantile(r, np.linspace(0, 1, n_bins + 1))
++    bin_id = np.clip(np.searchsorted(edges[1:-1], r, side="right"), 0, n_bins - 1)
++    rows, ece = [], 0.0
++    for b in range(n_bins):
++        m = bin_id == b
++        if not m.any():
++            continue
++        obs, lo, hi = km_risk_at(t[m], e[m], horizon)
++        pred = float(r[m].mean())
++        rows.append({"bin": b, "n": int(m.sum()), "mean_predicted": pred,
++                     "observed_km": float(obs), "observed_lo": float(lo),
++                     "observed_hi": float(hi), "n_events": int((e[m] & (t[m] <= horizon)).sum())})
++        if np.isfinite(obs):
++            ece += (m.sum() / n) * abs(pred - obs)
++    return rows, float(ece)

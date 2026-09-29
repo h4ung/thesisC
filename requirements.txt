@@ -1,0 +1,13 @@
+torch>=2.0
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+scikit-learn>=1.3
+pyarrow>=12.0
+PyYAML>=6.0
+wfdb>=4.1
+tqdm>=4.65
+# optional: utils.metrics auto-detects lifelines and uses it for the C-index
+# (the numpy fallback is vectorised and gives identical values, just slower)
+# lifelines>=0.27
+matplotlib>=3.7   # optional: scripts/plot_results.py

@@ -1,0 +1,1450 @@
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -0,0 +1,169 @@
++# Patches — correctness fixes
++
++Seven issues, in order of how badly they affect reported numbers. The first three
++would have **silently invalidated results**: nothing crashes, the metrics just
++come out wrong.
++
++---
++
++## 1. YAML silently overrode the CLI — the ablations did not ablate
++
++**Files:** `run.py`
++
++`apply_yaml()` ran *after* `parse_args()` and unconditionally `setattr`-ed every
++YAML key onto the namespace, so YAML beat the CLI (the opposite of the
++docstring). Consequences:
++
++* `--config configs/ckd_prognosis.yaml --use_ehr 0` ran with `use_ehr=True`. The
++  "ECG-only" and "EHR-only" ablations were **both the full multimodal model**.
++* `--setting ckd_2y_ecg_only` was overwritten by `setting: ckd_2y_survival_multimodal`
++  from the YAML, so every ablation wrote to the *same* checkpoint and results
++  directory, overwriting the previous run.
++
++**Fix:** `resolve_args()` establishes `explicit CLI > YAML > argparse default`.
++A second parser with `default=argparse.SUPPRESS` reveals exactly which flags were
++typed; YAML only fills the rest. YAML values are cast through the same `type=`
++callable argparse would use, unknown YAML keys warn, and a missing `--config`
++raises instead of being ignored. `run.py` no longer imports torch at module level,
++so the precedence logic is unit-testable on a bare box.
++
++**Tests:** `tests/test_config_override.py`
++**Action required:** any ablation table produced before this fix must be re-run.
++
++---
++
++## 2. `test()` never loaded a checkpoint
++
++**Files:** `exp/exp_basic.py`, `exp/exp_ckd_prognosis.py`
++
++Only `train()` restored weights, at the very end of the loop. `--is_training 0`
++therefore built a fresh model and evaluated **randomly initialised weights** —
++producing a plausible-looking C-index near 0.5 and no error.
++
++**Fix:** `Exp_Basic.load_checkpoint()` / `checkpoint_file()`; `test()` always
++loads from disk before scoring, and raises `FileNotFoundError` when the checkpoint
++is absent. Added `--checkpoint_path` to point at an arbitrary `.pth`. Eval-only
++runs also reload the `ehr_scaler.json` saved next to the checkpoint, so test-time
++preprocessing is identical to training. `torch.load` is called with
++`weights_only=True` (with a fallback for older torch).
++
++**Tests:** `tests/test_checkpoint_and_schedule.py`
++
++---
++
++## 3. Time-dependent AUROC counted early-censored patients as negatives
++
++**Files:** `exp/exp_ckd_prognosis.py`, `utils/metrics.py`
++
++`time_dependent_auroc` accepts an `eligible_mask`, but `validate()` never passed
++one. A patient censored at day 50 has an **unknown** 2-year label; scoring them as
++a negative pads the negative class with easy cases the model was never tested on
++and inflates the metric.
++
++**Fix:** `validate()` collects `eligible_binary` (defined in
++`data_preprocessing/build_cohort.py` as *event by horizon* OR *followed to
++horizon*) and passes it as the mask for all fixed-horizon metrics. Metrics now
++report `n_eligible` / `n_total` so the drop is visible. Added
++`utils.metrics.horizon_eligibility()` as a fallback, plus `brier_at_horizon`.
++The C-index still uses everyone — censoring is handled by the comparable-pair
++definition there.
++
++**Tests:** `tests/test_metrics.py::test_td_auroc_is_inflated_when_censored_counted_as_negative`
++(a worked example where the honest AUROC is 0.50 and the buggy one reads 0.80).
++
++---
++
++## 4. `lradj: type1` halved the LR every epoch
++
++**Files:** `utils/tools.py`, `run.py`, `configs/*.yaml`
++
++`0.5 ** (epoch - 1)` takes `1e-4` to `~2e-7` by epoch 10 and `~1e-13` by epoch 30
++(the configured budget). Training stopped learning long before early stopping
++triggered, and the "converged" model was whatever epoch 3–4 produced.
++
++**Fix:** default is now `cosine` over `train_epochs`. Added `step`
++(`--lr_decay_every`, `--lr_decay_rate`) and `none`. `type1` is retained, floored
++at `--min_lr`, and documented as legacy-only. The schedule is now stepped with
++`epoch + 2`, i.e. it sets the LR for the *next* epoch, so epoch 1 trains at the
++full configured LR. The current LR is printed each epoch.
++
++**Tests:** `tests/test_checkpoint_and_schedule.py`
++
++---
++
++## 5. C-index was an O(n²) Python double loop
++
++**Files:** `utils/metrics.py`
++
++Fine for a validation split, minutes-long on a full test cohort.
++
++**Fix:** uses `lifelines.utils.concordance_index` when installed (note the sign
++flip — lifelines expects a score where higher = *longer* survival, we predict
++risk), otherwise a blocked, vectorised numpy path. Same pair definition and tie
++handling, streamed in blocks so no `n × n` matrix is allocated. Verified
++bit-identical to the original loop on random cohorts with ties in both time and
++risk; 20,000 patients in ~0.8 s.
++
++**Tests:** `tests/test_metrics.py` (compares against the original loop, kept in
++the test file as ground truth).
++
++---
++
++## 6. `cross` fusion attended over G tokens, not the patch sequence
++
++**Files:** `models/CardioformerCKD.py`, `models/Cardioformer.py`,
++`layers/Cardioformer_EncDec.py`
++
++`encode()` mean-pooled each granularity before returning, and `_encode_ecg()` then
++reshaped that pooled vector into `(B, G, d_model)`. So the "cross-attention"
++had only **G = 9–12 keys** — one summary per granularity — and could not attend to
++the waveform at all. It was closer to a gated pool over granularities than to the
++cross-modal attention the docstring describes.
++
++**Fix:** `CardioformerEncoder.forward(..., return_streams=True)` and
++`Model.encode(..., return_tokens=True)` expose the full multi-granularity token
++sequence `(B, T, d_model)`, `T = Σ_g ⌈seq_len / patch_len_g⌉` (≈ 350 tokens for
++`seq_len=250` with the 12-granularity list). `CrossAttentionFusion` now attends
++over those, with a residual + LayerNorm around the EHR query, and stashes the
++attention weights on `.last_attn` for interpretability plots — which is a genuinely
++useful thesis figure: *which part of the ECG, at which scale, does this patient's
++EHR profile make the model look at?*
++
++The old behaviour is kept as `--cross_attn_tokens granularity`, so
++patches-vs-granularity is now a reportable ablation (`scripts/evaluate_ckd.sh`).
++
++**Tests:** `tests/test_model_forward.py` (asserts the attention map is
++`(B, 1, T)` with `T ≫ G`).
++
++---
++
++## 7. Provenance of the Cardioformer backbone
++
++**Files:** `models/Cardioformer.py`, `models/CardioformerCKD.py`, `README.md`
++
++The backbone is a clean-room re-implementation from arXiv:2505.05538, not the
++authors' code, and has never been validated against their weights. That must be
++stated in the thesis: published Cardioformer numbers are **not** comparable to
++these, the ECG-only baseline is *"our re-implementation of Cardioformer"*, and a
++gap against the paper is expected rather than a failed reproduction. Now recorded
++in the module docstrings and the README.
++
++---
++
++## Behavioural changes to be aware of
++
++| change | effect |
++|---|---|
++| default `lradj` `type1` → `cosine` | old runs are **not** bit-reproducible unless you pass `--lradj type1` |
++| default `fusion=cross` now attends over patches | pass `--cross_attn_tokens granularity` for the old behaviour |
++| `test()` requires a checkpoint | eval-only runs now fail loudly instead of scoring noise |
++| `td_auroc` masked by eligibility | this number will **go down** relative to previously logged values; the earlier one was wrong |
++| metrics json gains `n_eligible`, `n_total`, `brier_at_horizon`, `checkpoint`, `setting` | — |
++
++## Test status
++
++`tests/test_config_override.py` and `tests/test_metrics.py` were executed and pass.
++The torch-dependent suites (`test_model_forward.py`, `test_checkpoint_and_schedule.py`,
++`test_dataloader_shapes.py`, `test_egfr.py`) are unmodified in their existing style
++and run under the CI workflow, which installs CPU torch — run `pytest tests/ -q`
++locally once before relying on them.
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -3,4 +3,67 @@
+ Multimodal **prognostic** deep-learning model that predicts whether a patient
+ will develop **incident chronic kidney disease (CKD)** within a future horizon,
+ by combining the **MIMIC-IV** electronic health record (EHR) with the
+-**MIMIC-IV-ECG** 12-lead waveform dataset.
+\ No newline at end of file
++**MIMIC-IV-ECG** 12-lead waveform dataset.
++
++## Provenance of the ECG backbone (important for the thesis)
++
++`models/Cardioformer.py`, `layers/Embed.py` and `layers/Cardioformer_EncDec.py`
++are an **independent clean-room re-implementation** of the Cardioformer encoder,
++written from the description in the paper (Mobin et al.,
++*Cardioformer: Advancing AI in ECG Analysis with Multi-Granularity Patching and
++ResNet*, [arXiv:2505.05538](https://arxiv.org/abs/2505.05538), 2025). **No code
++from the authors' repository was used, and this implementation has not been
++validated against their released weights or results.**
++
++Therefore:
++
++* published Cardioformer numbers are **not** directly comparable to numbers
++  produced here — the ECG-only baseline should be reported as *"our
++  re-implementation of Cardioformer"*, never as *"Cardioformer"*;
++* details the paper leaves unspecified (patch strides, router-token design,
++  normalisation placement, initialisation) are our own choices, documented in the
++  module docstrings;
++* a gap against the published results is expected and is a property of the
++  re-implementation, not a failed reproduction.
++
++## Configuration precedence
++
++```
++explicit CLI flag  >  --config YAML  >  argparse default
++```
++
++`run.py::resolve_args` only writes a YAML key into the namespace if that flag was
++**not** typed on the command line. This is what makes
++
++```bash
++python run.py --config configs/ckd_prognosis.yaml --setting ckd_2y_ecg_only --use_ehr 0
++```
++
++a real ablation (and keeps it writing to its own checkpoint/results directory
++rather than the `setting` declared inside the YAML).
++
++## Evaluating a trained model
++
++```bash
++python run.py --is_training 0 --config configs/ckd_prognosis.yaml \
++  --setting ckd_2y_survival_multimodal          # loads checkpoints/<setting>/checkpoint.pth
++python run.py --is_training 0 --checkpoint_path path/to/checkpoint.pth ...   # or point at one
++```
++
++`test()` always loads the checkpoint from disk before scoring. A missing
++checkpoint raises `FileNotFoundError` rather than silently evaluating randomly
++initialised weights.
++
++## Reported metrics
++
++| metric | computed over |
++|---|---|
++| `c_index` | all patients (right-censoring handled by the comparable-pair definition) |
++| `td_auroc` | **eligible patients only** — event by the horizon, or follow-up reaching it |
++| `brier_at_horizon` | eligible patients only |
++| `n_eligible` / `n_total` | how many patients the horizon metrics were computed on |
++
++Patients censored *before* the horizon have an unknown horizon label; scoring
++them as negatives inflates `td_auroc` (see `tests/test_metrics.py`).
++
++See `PATCHES.md` for the full list of fixes and their effect on results.
+Binary files a/{} and b/{} differ
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -20,6 +20,7 @@
+ use_ehr: true
+ ehr_mode: mlp
+ fusion: gated
++cross_attn_tokens: patches
+ head: survival
+ n_intervals: 8
+ 
+@@ -27,4 +28,6 @@
+ learning_rate: 0.0001
+ train_epochs: 30
+ patience: 6
++lradj: cosine
++min_lr: 0.000001
+ seed: 41
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -1,5 +1,7 @@
+ # Default configuration for CardioformerCKD.
+-# CLI flags to run.py override anything set here.
++# Precedence: explicit CLI flag > this file > argparse default.
++# (run.py::resolve_args only fills in keys you did NOT pass on the command line,
++#  so e.g. `--config configs/default.yaml --use_ehr 0` really does ablate EHR.)
+ 
+ task_name: ckd_prognosis
+ model: CardioformerCKD
+@@ -30,6 +32,7 @@
+ ehr_mode: mlp
+ ehr_dropout: 0.2
+ fusion: gated       # concat | gated | cross
++cross_attn_tokens: patches   # patches | granularity (cross fusion only)
+ d_fuse: 256
+ head: survival      # binary | survival
+ n_intervals: 8
+@@ -40,7 +43,10 @@
+ weight_decay: 0.0001
+ train_epochs: 20
+ patience: 5
+-lradj: type1
++lradj: cosine       # cosine | step | type1 (legacy: halves LR every epoch) | none
++lr_decay_every: 5   # lradj=step only
++lr_decay_rate: 0.5  # lradj=step only
++min_lr: 0.000001
+ focal_alpha: 0.25
+ focal_gamma: 2.0
+ seed: 41
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -1,5 +1,7 @@
+ """Base experiment class (Time-Series-Library style)."""
+ 
++import os
++
+ import torch
+ 
+ 
+@@ -21,6 +23,42 @@
+             print("Use CPU")
+         return dev
+ 
++    # ---- checkpoints -----------------------------------------------------
++    def checkpoint_dir(self):
++        return os.path.join(self.args.checkpoints, self.args.setting)
++
++    def checkpoint_file(self):
++        """Explicit --checkpoint_path if given, else <checkpoints>/<setting>/checkpoint.pth."""
++        explicit = getattr(self.args, "checkpoint_path", None)
++        if explicit:
++            return explicit
++        return os.path.join(self.checkpoint_dir(), "checkpoint.pth")
++
++    def load_checkpoint(self, path=None, required=True):
++        """Load model weights from disk.
++
++        ``test()`` must call this: previously only ``train()`` restored the best
++        weights at the end of the loop, so ``--is_training 0`` silently evaluated
++        a randomly initialised model.
++        """
++        path = path or self.checkpoint_file()
++        if not os.path.exists(path):
++            if required:
++                raise FileNotFoundError(
++                    f"No checkpoint at {path}. Train first (--is_training 1), or point "
++                    f"--checkpoint_path at an existing .pth."
++                )
++            print(f"[checkpoint] none found at {path}; using current weights")
++            return False
++        try:  # torch >= 2.6 defaults to weights_only=True; be explicit either way
++            state = torch.load(path, map_location=self.device, weights_only=True)
++        except TypeError:  # pragma: no cover - older torch
++            state = torch.load(path, map_location=self.device)
++        self.model.load_state_dict(state)
++        self.model.to(self.device)
++        print(f"[checkpoint] loaded {path}")
++        return True
++
+     def train(self):
+         raise NotImplementedError
+ 
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -9,11 +9,14 @@
+ import torch.optim as optim
+ 
+ from data_provider.data_factory import data_provider
++from data_provider.data_loader import EHRStandardizer
+ from exp.exp_basic import Exp_Basic
+ from models.CardioformerCKD import CardioformerCKD
+ from models.heads import DiscreteTimeSurvivalHead
+ from utils.losses import focal_bce, discrete_time_nll
+-from utils.metrics import binary_metrics, concordance_index, time_dependent_auroc
++from utils.metrics import (
++    binary_metrics, brier_score, concordance_index, time_dependent_auroc,
++)
+ from utils.tools import EarlyStopping, adjust_learning_rate, set_seed
+ 
+ 
+@@ -22,14 +25,29 @@
+         set_seed(args.seed)
+         # discover ehr_in_dim from the train dataset before building the model
+         self.train_data, self.train_loader = data_provider(args, "train")
+-        args.ehr_in_dim = self.train_data.ehr_dim
+         self._scaler = self.train_data.scaler
+         self._ehr_columns = self.train_data.ehr_columns
++
++        # For eval-only runs, prefer the scaler persisted alongside the checkpoint
++        # so preprocessing at test time is byte-identical to training.
++        if not args.is_training:
++            self._load_saved_scaler(os.path.join(args.checkpoints, args.setting,
++                                                 "ehr_scaler.json"))
++
++        args.ehr_in_dim = len(self._ehr_columns)
+         super().__init__(args)
+ 
++    def _load_saved_scaler(self, path):
++        if not os.path.exists(path):
++            return False
++        state = json.load(open(path))
++        self._scaler = EHRStandardizer().load_state_dict(state)
++        self._ehr_columns = list(state["columns_"])
++        print(f"[scaler] loaded fitted EHR scaler from {path}")
++        return True
++
+     def _build_model(self):
+-        model = CardioformerCKD(self.args)
+-        return model
++        return CardioformerCKD(self.args)
+ 
+     def _get_data(self, flag):
+         return data_provider(self.args, flag,
+@@ -63,7 +81,7 @@
+         _, train_loader = self.train_data, self.train_loader
+         _, vali_loader = self._get_data("val")
+ 
+-        path = os.path.join(self.args.checkpoints, self.args.setting)
++        path = self.checkpoint_dir()
+         os.makedirs(path, exist_ok=True)
+         # persist the fitted scaler for inference
+         if self._scaler is not None:
+@@ -89,7 +107,8 @@
+                 losses.append(loss.item())
+ 
+             val_score, val_metrics = self.validate(vali_loader)
+-            print(f"Epoch {epoch+1} | train_loss {np.mean(losses):.4f} | "
++            lr_now = optimizer.param_groups[0]["lr"]
++            print(f"Epoch {epoch+1} | lr {lr_now:.2e} | train_loss {np.mean(losses):.4f} | "
+                   f"val_score {val_score:.4f} | {val_metrics} | "
+                   f"{time.time()-t0:.1f}s")
+ 
+@@ -97,51 +116,78 @@
+             if early.early_stop:
+                 print("Early stopping")
+                 break
+-            adjust_learning_rate(optimizer, epoch + 1, self.args)
++            adjust_learning_rate(optimizer, epoch + 2, self.args)  # LR for the *next* epoch
+ 
+-        self.model.load_state_dict(torch.load(os.path.join(path, "checkpoint.pth")))
++        # restore the best weights before returning / testing
++        self.load_checkpoint(os.path.join(path, "checkpoint.pth"))
+         return self.model
+ 
+     @torch.no_grad()
+     def validate(self, loader):
+         self.model.eval()
+         probs, labels, elig = [], [], []
+-        risks, times, events, cif_h = [], [], [], []
++        risks, times, events = [], [], []
+         horizon_bin = self.args.n_intervals - 1
+         for batch in loader:
+             x_ecg, ehr = self._to_device(batch)
+             out = self.model(x_ecg=x_ecg, ehr=ehr)
+             if self.args.head == "binary":
+-                p = torch.sigmoid(out).cpu().numpy()
+-                probs.append(p)
++                probs.append(torch.sigmoid(out).cpu().numpy())
+                 labels.append(batch["label_binary"].numpy())
+                 elig.append(batch["eligible_binary"].numpy())
+             else:
+-                surv, cif = DiscreteTimeSurvivalHead.survival_from_hazards(out)
++                _, cif = DiscreteTimeSurvivalHead.survival_from_hazards(out)
+                 cif = cif.cpu().numpy()
+-                cif_h.append(cif[:, horizon_bin])
+                 risks.append(cif[:, horizon_bin])          # risk by horizon
+                 times.append(batch["event_time_days"].numpy())
+                 events.append(batch["event_indicator"].numpy())
+                 labels.append(batch["label_binary"].numpy())
++                elig.append(batch["eligible_binary"].numpy())
++
++        labels = np.concatenate(labels)
++        elig = np.concatenate(elig).astype(bool)
+ 
+         if self.args.head == "binary":
+-            probs = np.concatenate(probs); labels = np.concatenate(labels)
+-            elig = np.concatenate(elig).astype(bool)
++            probs = np.concatenate(probs)
+             m = binary_metrics(labels[elig], probs[elig])
++            m["n_eligible"] = int(elig.sum())
++            m["n_total"] = int(elig.size)
+             return m.get("auroc", float("nan")), m
+-        else:
+-            risks = np.concatenate(risks); times = np.concatenate(times)
+-            events = np.concatenate(events); labels = np.concatenate(labels)
+-            cidx = concordance_index(times, risks, events)
+-            td_auroc = time_dependent_auroc(np.concatenate(cif_h), labels)
+-            return (cidx if not np.isnan(cidx) else 0.0,
+-                    {"c_index": round(cidx, 4), "td_auroc": round(td_auroc, 4)})
++
++        risks = np.concatenate(risks)
++        times = np.concatenate(times)
++        events = np.concatenate(events)
++
++        # C-index uses everyone (right-censoring is handled by the pair definition).
++        cidx = concordance_index(times, risks, events)
++        # The fixed-horizon metrics may only use patients whose horizon label is
++        # actually known: an event by the horizon, or follow-up reaching it.
++        # Passing the eligibility mask here is what stops patients censored early
++        # from being silently scored as negatives (which inflates the AUROC).
++        td_auroc = time_dependent_auroc(risks, labels, eligible_mask=elig)
++        brier = brier_score(labels[elig], risks[elig]) if elig.any() else float("nan")
++
++        metrics = {
++            "c_index": round(float(cidx), 4),
++            "td_auroc": round(float(td_auroc), 4),
++            "brier_at_horizon": round(float(brier), 4),
++            "n_eligible": int(elig.sum()),
++            "n_total": int(elig.size),
++        }
++        score = cidx if not np.isnan(cidx) else 0.0
++        return score, metrics
+ 
+     @torch.no_grad()
+     def test(self):
++        # Always evaluate the saved best weights, never whatever happens to be in
++        # memory. Required when --is_training 0: without this the model is random.
++        self.load_checkpoint()
++
+         _, test_loader = self._get_data("test")
+         score, metrics = self.validate(test_loader)
++        metrics["checkpoint"] = self.checkpoint_file()
++        metrics["setting"] = self.args.setting
++
+         out_dir = os.path.join(self.args.results, self.args.setting)
+         os.makedirs(out_dir, exist_ok=True)
+         json.dump(metrics, open(os.path.join(out_dir, "test_metrics.json"), "w"), indent=2)
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -79,9 +79,19 @@
+         ])
+         self.norm = nn.LayerNorm(d_model)
+ 
+-    def forward(self, streams):
++    def forward(self, streams, return_streams=False):
++        """streams: list of (B, n_g, d_model).
++
++        Returns the per-granularity pooled representation ``(B, G, d_model)``.
++        With ``return_streams=True`` the *full* normalised token sequences are
++        also returned, so a downstream module (e.g. the cross-attention fusion in
++        ``models.CardioformerCKD``) can attend over every patch token instead of
++        only the G pooled summaries.
++        """
+         for layer in self.layers:
+             streams = layer(streams)
+-        # final representation: concat the mean-pooled token of each granularity
+-        pooled = [self.norm(s).mean(dim=1) for s in streams]   # list of (B, d_model)
+-        return torch.stack(pooled, dim=1)                      # (B, G, d_model)
++        normed = [self.norm(s) for s in streams]               # list of (B, n_g, d_model)
++        pooled = torch.stack([s.mean(dim=1) for s in normed], dim=1)   # (B, G, d_model)
++        if return_streams:
++            return pooled, normed
++        return pooled
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -1,10 +1,27 @@
+ """Cardioformer ECG backbone.
+ 
+-Re-implementation of the Cardioformer encoder (Mobin et al., 2025) following the
+-Time-Series-Library ``Model(configs)`` convention so it can be used as a drop-in
+-ECG encoder. The original repo exposes a ``classification`` task head; here the
+-backbone is reusable for both classification and as a feature extractor for the
+-multimodal prognostic model (``models.CardioformerCKD``).
++PROVENANCE / CLEAN-ROOM NOTE
++---------------------------
++This is an *independent clean-room re-implementation* of the Cardioformer encoder
++written from the description in the paper (Mobin et al., "Cardioformer:
++Advancing AI in ECG Analysis with Multi-Granularity Patching and ResNet",
++arXiv:2505.05538, 2025). No code from the authors' repository was used, and the
++implementation has not been verified against their released weights or results.
++
++Consequences that must be stated in the thesis:
++  * published Cardioformer numbers are NOT directly comparable to numbers from
++    this code -- any ECG-only baseline here is "our re-implementation of
++    Cardioformer", not "Cardioformer";
++  * undocumented details (patch strides, router-token design, normalisation
++    placement, initialisation) are our own choices and are documented in
++    layers/Embed.py and layers/Cardioformer_EncDec.py;
++  * a gap against the published results is therefore expected and should not be
++    reported as a failure to reproduce the paper.
++
++It follows the Time-Series-Library ``Model(configs)`` convention so it can be used
++as a drop-in ECG encoder. The backbone is reusable both for classification and as
++a feature extractor for the multimodal prognostic model
++(``models.CardioformerCKD``).
+ 
+ Expected ``configs`` attributes
+ -------------------------------
+@@ -70,10 +87,22 @@
+             self.projection = nn.Linear(self.n_gran * configs.d_model, configs.num_class)
+ 
+     # ---- core feature extractor --------------------------------------------
+-    def encode(self, x_enc):
+-        """x_enc: (B, seq_len, enc_in) in TSLib layout. Returns (B, G*d_model)."""
++    def encode(self, x_enc, return_tokens=False):
++        """x_enc: (B, seq_len, enc_in) in TSLib layout.
++
++        Returns ``(B, G*d_model)``: the mean-pooled token of each granularity,
++        concatenated. With ``return_tokens=True`` also returns the full patch
++        token sequence ``(B, T, d_model)`` -- every token from every granularity
++        concatenated along time, where ``T = sum_g ceil(seq_len / patch_len_g)``.
++        The pooled vector alone throws that sequence away, which is why the
++        cross-attention fusion needs this flag (see models/CardioformerCKD.py).
++        """
+         x = x_enc.permute(0, 2, 1).contiguous()   # -> (B, C, L)
+         streams = self.embedding(x)               # list of (B, n_g, d_model)
++        if return_tokens:
++            enc, normed = self.encoder(streams, return_streams=True)
++            tokens = torch.cat(normed, dim=1)     # (B, T, d_model)
++            return enc.reshape(enc.size(0), -1), tokens
+         enc = self.encoder(streams)               # (B, G, d_model)
+         return enc.reshape(enc.size(0), -1)       # (B, G*d_model)
+ 
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -17,7 +17,12 @@
+ 
+ ``configs`` reuses the Cardioformer attributes (see models/Cardioformer.py) plus:
+ ehr_in_dim, ehr_mode ('mlp'|'seq'), fusion ('concat'|'gated'|'cross'),
++cross_attn_tokens ('patches'|'granularity', cross fusion only),
+ head ('binary'|'survival'), n_intervals (survival only), use_ecg, use_ehr.
++
++Provenance: the ECG backbone is a clean-room re-implementation of Cardioformer
++from the paper (Mobin et al., 2025, arXiv:2505.05538), not the authors' code.
++See the note in models/Cardioformer.py.
+ """
+ 
+ import torch
+@@ -45,30 +50,55 @@
+ 
+ 
+ class CrossAttentionFusion(nn.Module):
+-    """EHR embedding attends over per-granularity ECG tokens (and vice versa)."""
++    """EHR embedding attends over the ECG token sequence.
++
++    ``ecg_tokens`` is the *full* multi-granularity patch sequence (B, T, d_model)
++    with T = sum_g ceil(seq_len / patch_len_g) -- a few hundred tokens for a 250-
++    sample window. Attending over these lets the EHR query select which parts of
++    the waveform (and which scale) matter for this patient.
++
++    Set ``configs.cross_attn_tokens='granularity'`` to attend over only the G
++    pooled per-granularity summaries instead (the original behaviour, kept for
++    ablation; it is a much weaker form of cross-attention because the pooling has
++    already discarded the within-granularity structure).
++    """
+ 
+-    def __init__(self, d_ecg_token, d_ehr, d_out, n_heads=4):
++    def __init__(self, d_ecg_token, d_ehr, d_out, n_heads=4, dropout=0.1):
+         super().__init__()
+         self.q = nn.Linear(d_ehr, d_out)
+         self.kv = nn.Linear(d_ecg_token, d_out)
+-        self.attn = nn.MultiheadAttention(d_out, n_heads, batch_first=True)
++        self.attn = nn.MultiheadAttention(d_out, n_heads, dropout=dropout, batch_first=True)
++        self.norm = nn.LayerNorm(d_out)
+         self.out = nn.Linear(d_out + d_ehr, d_out)
+ 
+-    def forward(self, ecg_tokens, z_ehr):
+-        # ecg_tokens: (B, G, d_ecg_token); z_ehr: (B, d_ehr)
+-        q = self.q(z_ehr).unsqueeze(1)          # (B,1,d_out)
+-        kv = self.kv(ecg_tokens)                # (B,G,d_out)
+-        ctx, _ = self.attn(q, kv, kv)           # (B,1,d_out)
+-        ctx = ctx.squeeze(1)
++    def forward(self, ecg_tokens, z_ehr, key_padding_mask=None):
++        # ecg_tokens: (B, T, d_ecg_token); z_ehr: (B, d_ehr)
++        q = self.q(z_ehr).unsqueeze(1)                       # (B, 1, d_out)
++        kv = self.kv(ecg_tokens)                             # (B, T, d_out)
++        ctx, attn = self.attn(q, kv, kv, key_padding_mask=key_padding_mask,
++                              need_weights=True)             # ctx (B,1,d_out), attn (B,1,T)
++        self.last_attn = attn.detach()                       # kept for interpretability plots
++        ctx = self.norm(q + ctx).squeeze(1)                  # residual around the query
+         return self.out(torch.cat([ctx, z_ehr], dim=-1))
+ 
+ 
++def _pick_heads(d_out, desired):
++    """Largest head count <= desired that divides d_out (MultiheadAttention requires it)."""
++    for h in range(max(1, min(int(desired), int(d_out))), 0, -1):
++        if d_out % h == 0:
++            return h
++    return 1
++
++
+ class CardioformerCKD(nn.Module):
+     def __init__(self, configs):
+         super().__init__()
+         self.use_ecg = getattr(configs, "use_ecg", True)
+         self.use_ehr = getattr(configs, "use_ehr", True)
+         self.fusion_mode = getattr(configs, "fusion", "gated")
++        # 'patches' -> attend over every patch token; 'granularity' -> only the G
++        # pooled granularity summaries (legacy behaviour, weaker).
++        self.cross_attn_tokens = getattr(configs, "cross_attn_tokens", "patches")
+         self.head_type = getattr(configs, "head", "survival")
+         self.d_model = configs.d_model
+ 
+@@ -110,7 +140,11 @@
+             elif self.fusion_mode == "gated":
+                 self.fuse = GatedFusion(d_ecg, d_ehr, d_fuse)
+             elif self.fusion_mode == "cross":
+-                self.fuse = CrossAttentionFusion(configs.d_model, d_ehr, d_fuse)
++                self.fuse = CrossAttentionFusion(
++                    configs.d_model, d_ehr, d_fuse,
++                    n_heads=_pick_heads(d_fuse, getattr(configs, "n_heads", 4)),
++                    dropout=getattr(configs, "dropout", 0.1),
++                )
+             else:
+                 raise ValueError(f"unknown fusion: {self.fusion_mode}")
+         else:
+@@ -127,17 +161,29 @@
+         else:
+             raise ValueError(f"unknown head: {self.head_type}")
+ 
+-    def _encode_ecg(self, x_ecg):
+-        feats = self.ecg.encode(x_ecg)                         # (B, G*d_model)
+-        tokens = feats.view(feats.size(0), self.n_gran, self.d_model)  # for cross-attn
++    def _encode_ecg(self, x_ecg, need_tokens=False):
++        """Return the pooled ECG embedding and, when needed, the token sequence.
++
++        ``need_tokens`` asks the backbone for the full multi-granularity patch
++        sequence (B, T, d_model). The previous version reshaped the pooled vector
++        into (B, G, d_model), so 'cross' fusion could only ever attend over G
++        granularity summaries -- not over the waveform itself.
++        """
++        if not need_tokens:
++            return self.ecg.encode(x_ecg), None
++        if self.cross_attn_tokens == "granularity":
++            feats = self.ecg.encode(x_ecg)                              # (B, G*d_model)
++            return feats, feats.view(feats.size(0), self.n_gran, self.d_model)
++        feats, tokens = self.ecg.encode(x_ecg, return_tokens=True)      # (B, T, d_model)
+         return feats, tokens
+ 
+     def forward(self, x_ecg=None, ehr=None, ehr_mask=None):
+         z_ecg = z_ehr = None
+         ecg_tokens = None
+ 
++        need_tokens = self.use_ecg and self.use_ehr and self.fusion_mode == "cross"
+         if self.use_ecg:
+-            z_ecg, ecg_tokens = self._encode_ecg(x_ecg)
++            z_ecg, ecg_tokens = self._encode_ecg(x_ecg, need_tokens=need_tokens)
+         if self.use_ehr:
+             if isinstance(self.ehr, EHRSequenceEncoder):
+                 z_ehr = self.ehr(ehr, key_padding_mask=ehr_mask)
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -7,5 +7,6 @@
+ PyYAML>=6.0
+ wfdb>=4.1
+ tqdm>=4.65
+-# optional, for a faster/validated concordance index on large cohorts:
++# optional: utils.metrics auto-detects lifelines and uses it for the C-index
++# (the numpy fallback is vectorised and gives identical values, just slower)
+ # lifelines>=0.27
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -13,24 +13,36 @@
+     --use_ecg 1 --use_ehr 1 \
+     --batch_size 16 --learning_rate 1e-4 --train_epochs 20 --patience 5
+ 
+-Each parameter is documented inline below. A YAML config can also be supplied
+-via --config; CLI flags override YAML values.
++Configuration precedence
++------------------------
++    explicit CLI flag  >  --config YAML  >  argparse default
++
++Implemented in ``resolve_args``: a second, defaults-suppressed parser discovers
++exactly which flags the user typed, and YAML values are only written into keys
++the user did *not* pass. The previous implementation applied the YAML *after*
++parsing, so YAML silently overrode the CLI -- which meant that e.g.
++``--config configs/ckd_prognosis.yaml --use_ehr 0`` did not actually ablate the
++EHR branch.
++
++``resolve_args`` imports nothing heavy, so it is unit-testable without torch
++(see tests/test_config_override.py).
+ """
+ 
+ import argparse
+ import os
++import sys
+ 
+ import yaml
+ 
+-from exp.exp_ckd_prognosis import Exp_CKD_Prognosis
+-
+ 
+ def str2bool(v):
++    if isinstance(v, bool):
++        return v
+     return str(v).lower() in ("1", "true", "yes", "y")
+ 
+ 
+ def build_parser():
+-    p = argparse.ArgumentParser(description="CardioformerCKD — prognostic CKD prediction")
++    p = argparse.ArgumentParser(description="CardioformerCKD - prognostic CKD prediction")
+ 
+     # basic
+     p.add_argument("--task_name", default="ckd_prognosis")
+@@ -64,6 +76,9 @@
+     p.add_argument("--ehr_mode", choices=["mlp", "seq"], default="mlp")
+     p.add_argument("--ehr_dropout", type=float, default=0.2)
+     p.add_argument("--fusion", choices=["concat", "gated", "cross"], default="gated")
++    p.add_argument("--cross_attn_tokens", choices=["patches", "granularity"], default="patches",
++                   help="what cross-attention fusion attends over: the full multi-granularity patch "
++                        "sequence (default) or only the G pooled granularity summaries (legacy)")
+     p.add_argument("--d_fuse", type=int, default=256)
+     p.add_argument("--head", choices=["binary", "survival"], default="survival")
+     p.add_argument("--n_intervals", type=int, default=8, help="survival time bins over horizon")
+@@ -74,7 +89,13 @@
+     p.add_argument("--weight_decay", type=float, default=1e-4)
+     p.add_argument("--train_epochs", type=int, default=20)
+     p.add_argument("--patience", type=int, default=5)
+-    p.add_argument("--lradj", default="type1")
++    p.add_argument("--lradj", choices=["cosine", "step", "type1", "none"], default="cosine",
++                   help="LR schedule. 'cosine' (default) anneals over train_epochs; 'step' decays "
++                        "by --lr_decay_rate every --lr_decay_every epochs; 'type1' is the legacy "
++                        "halve-every-epoch schedule (kept for reproducibility; not recommended)")
++    p.add_argument("--lr_decay_every", type=int, default=5, help="epochs per decay step (lradj=step)")
++    p.add_argument("--lr_decay_rate", type=float, default=0.5, help="decay factor (lradj=step)")
++    p.add_argument("--min_lr", type=float, default=1e-6, help="floor for the LR schedule")
+     p.add_argument("--focal_alpha", type=float, default=0.25)
+     p.add_argument("--focal_gamma", type=float, default=2.0)
+     p.add_argument("--seed", type=int, default=41)
+@@ -84,27 +105,77 @@
+     p.add_argument("--gpu", type=int, default=0)
+     p.add_argument("--devices", default="0")
+     p.add_argument("--checkpoints", default="checkpoints/ckd_prognosis")
++    p.add_argument("--checkpoint_path", default=None,
++                   help="explicit checkpoint .pth to load "
++                        "(default: <checkpoints>/<setting>/checkpoint.pth)")
+     p.add_argument("--results", default="results/ckd_prognosis")
+     return p
+ 
+ 
+-def apply_yaml(args):
+-    if args.config and os.path.exists(args.config):
+-        cfg = yaml.safe_load(open(args.config))
+-        defaults = {k: v for k, v in cfg.items() if hasattr(args, k)}
+-        # only set values the user did not explicitly pass on the CLI
+-        for k, v in defaults.items():
+-            setattr(args, k, v)
++def _explicit_cli_keys(argv):
++    """Return the set of dests the user actually passed on the command line.
++
++    Re-build the same parser with every default suppressed, so the resulting
++    namespace contains *only* the flags that appeared in ``argv``.
++    """
++    p = build_parser()
++    for action in p._actions:
++        if action.dest != "help":
++            action.default = argparse.SUPPRESS
++    ns, _ = p.parse_known_args(argv)
++    return set(vars(ns).keys())
++
++
++def _coerce(parser, key, value):
++    """Cast a YAML value with the same ``type=`` callable argparse would use."""
++    action = next((a for a in parser._actions if a.dest == key), None)
++    if action is None or action.type is None or isinstance(value, (list, dict)):
++        return value
++    try:
++        return action.type(value)
++    except (TypeError, ValueError):
++        return value
++
++
++def resolve_args(argv=None):
++    """Parse CLI + YAML with precedence: explicit CLI > YAML > argparse default."""
++    argv = list(sys.argv[1:] if argv is None else argv)
++    parser = build_parser()
++    args = parser.parse_args(argv)
++    passed = _explicit_cli_keys(argv)
++
++    if args.config:
++        if not os.path.exists(args.config):
++            raise FileNotFoundError(f"--config not found: {args.config}")
++        cfg = yaml.safe_load(open(args.config)) or {}
++        known = {a.dest for a in parser._actions}
++        unknown = sorted(set(cfg) - known)
++        if unknown:
++            print(f"[config] warning: ignoring unknown key(s) in {args.config}: {', '.join(unknown)}")
++        overridden = []
++        for k, v in cfg.items():
++            if k not in known or k == "config":
++                continue
++            if k in passed:                      # explicit CLI flag wins
++                overridden.append(k)
++                continue
++            setattr(args, k, _coerce(parser, k, v))
++        if overridden:
++            print(f"[config] CLI overrides YAML for: {', '.join(sorted(overridden))}")
++
++    args.cli_overrides = sorted(passed - {"config"})
+     return args
+ 
+ 
+-def main():
+-    args = build_parser().parse_args()
+-    args = apply_yaml(args)
++def main(argv=None):
++    args = resolve_args(argv)
+ 
+     os.environ.setdefault("CUDA_VISIBLE_DEVICES", args.devices)
+     print("Args:", vars(args))
+ 
++    # imported late so resolve_args() stays importable without torch installed
++    from exp.exp_ckd_prognosis import Exp_CKD_Prognosis
++
+     exp = Exp_CKD_Prognosis(args)
+     if args.is_training:
+         exp.train()
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -1,9 +1,18 @@
+ #!/usr/bin/env bash
+ # Evaluate a trained checkpoint and run modality ablations (ECG-only, EHR-only).
++#
++# NOTE: --is_training 0 loads <checkpoints>/<setting>/checkpoint.pth and evaluates
++# it. If that file does not exist the run now fails loudly instead of silently
++# scoring a randomly initialised model.
++#
++# NOTE: CLI flags override the YAML (run.py::resolve_args). That is what makes the
++# ablations below real ablations -- and what keeps each --setting writing to its
++# own checkpoint/results directory instead of all of them clobbering the setting
++# name declared inside ckd_prognosis.yaml.
+ set -euo pipefail
+ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+ 
+-# evaluate the trained multimodal model
++# evaluate the trained multimodal model (no training)
+ python run.py --is_training 0 --config configs/ckd_prognosis.yaml \
+   --setting ckd_2y_survival_multimodal
+ 
+@@ -18,3 +27,11 @@
+ # ablation: fixed-horizon binary head instead of survival
+ python run.py --is_training 1 --config configs/ckd_prognosis.yaml \
+   --setting ckd_2y_binary --head binary
++
++# ablation: cross-attention fusion over the full patch sequence
++python run.py --is_training 1 --config configs/ckd_prognosis.yaml \
++  --setting ckd_2y_cross_patches --fusion cross --cross_attn_tokens patches
++
++# ablation: cross-attention over pooled granularity tokens only (legacy behaviour)
++python run.py --is_training 1 --config configs/ckd_prognosis.yaml \
++  --setting ckd_2y_cross_granularity --fusion cross --cross_attn_tokens granularity
+Binary files a/{} and b/{} differ
+Binary files a/{} and b/{} differ
+Binary files a/{} and b/{} differ
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -0,0 +1,102 @@
++"""Guards for two silent-failure bugs.
++
++1. ``test()`` used to evaluate whatever weights were in memory. With
++   ``--is_training 0`` that is a randomly initialised model, and the reported
++   test metrics are meaningless. ``Exp_Basic.load_checkpoint`` now does the load
++   and raises if the checkpoint is missing.
++2. ``lradj='type1'`` halves the LR every epoch (1e-4 -> ~1e-7 by epoch 10), so
++   training stops learning almost immediately. The default is now cosine.
++"""
++
++import argparse
++
++import pytest
++import torch
++import torch.nn as nn
++
++from exp.exp_basic import Exp_Basic
++from utils.tools import EarlyStopping, adjust_learning_rate
++
++
++class TinyModel(nn.Module):
++    def __init__(self, bias=0.0):
++        super().__init__()
++        self.lin = nn.Linear(4, 2)
++        with torch.no_grad():
++            self.lin.bias.fill_(bias)
++
++    def forward(self, x):
++        return self.lin(x)
++
++
++class TinyExp(Exp_Basic):
++    def _build_model(self):
++        return TinyModel()
++
++
++def _args(tmp_path, **kw):
++    d = dict(use_gpu=False, gpu=0, checkpoints=str(tmp_path), setting="unit",
++             checkpoint_path=None, learning_rate=1e-4, train_epochs=10,
++             lradj="cosine", min_lr=1e-6, lr_decay_every=5, lr_decay_rate=0.5)
++    d.update(kw)
++    return argparse.Namespace(**d)
++
++
++# ---- checkpoint loading -------------------------------------------------
++def test_load_checkpoint_restores_saved_weights(tmp_path):
++    exp = TinyExp(_args(tmp_path))
++    trained = TinyModel(bias=3.14)
++    EarlyStopping()(0.9, trained, exp.checkpoint_dir())   # writes checkpoint.pth
++
++    assert not torch.allclose(exp.model.lin.bias, trained.lin.bias)
++    exp.load_checkpoint()
++    assert torch.allclose(exp.model.lin.bias, trained.lin.bias)
++
++
++def test_missing_checkpoint_raises_instead_of_scoring_random_weights(tmp_path):
++    exp = TinyExp(_args(tmp_path, setting="never_trained"))
++    with pytest.raises(FileNotFoundError):
++        exp.load_checkpoint()
++
++
++def test_explicit_checkpoint_path_wins(tmp_path):
++    exp = TinyExp(_args(tmp_path))
++    other = tmp_path / "elsewhere.pth"
++    torch.save(TinyModel(bias=-1.5).state_dict(), other)
++    exp.args.checkpoint_path = str(other)
++    assert exp.checkpoint_file() == str(other)
++    exp.load_checkpoint()
++    assert torch.allclose(exp.model.lin.bias, torch.full((2,), -1.5))
++
++
++# ---- LR schedule --------------------------------------------------------
++def _lr_after(args, epoch):
++    opt = torch.optim.Adam(TinyModel().parameters(), lr=args.learning_rate)
++    adjust_learning_rate(opt, epoch, args)
++    return opt.param_groups[0]["lr"]
++
++
++def test_cosine_decays_gently_and_is_the_default(tmp_path):
++    args = _args(tmp_path, lradj="cosine", train_epochs=20)
++    assert _lr_after(args, 1) == pytest.approx(1e-4)          # epoch 1: full LR
++    mid = _lr_after(args, 11)
++    assert 0.3e-4 < mid < 0.7e-4                              # ~half-way by mid-run
++    assert _lr_after(args, 10) > 1e-5                         # not collapsed by epoch 10
++
++
++def test_type1_collapse_is_reproduced_but_floored(tmp_path):
++    args = _args(tmp_path, lradj="type1")
++    assert _lr_after(args, 10) == pytest.approx(max(1e-4 * 0.5 ** 9, args.min_lr))
++    assert _lr_after(args, 10) < 1e-6 * 1.0001                # this is why it is not the default
++
++
++def test_step_schedule(tmp_path):
++    args = _args(tmp_path, lradj="step", lr_decay_every=5, lr_decay_rate=0.5)
++    assert _lr_after(args, 1) == pytest.approx(1e-4)
++    assert _lr_after(args, 5) == pytest.approx(1e-4)
++    assert _lr_after(args, 6) == pytest.approx(0.5e-4)
++
++
++def test_none_schedule_is_constant(tmp_path):
++    args = _args(tmp_path, lradj="none")
++    assert _lr_after(args, 50) == pytest.approx(1e-4)
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -0,0 +1,81 @@
++"""Precedence: explicit CLI flag > --config YAML > argparse default.
++
++These guard the bug where apply_yaml() overwrote the parsed namespace, so
++`--config ... --use_ehr 0` silently kept use_ehr=True and the "ablations" did
++not ablate anything.
++
++run.py imports torch only inside main(), so these run on a bare CI box.
++"""
++
++import textwrap
++
++import pytest
++
++from run import resolve_args
++
++YAML = textwrap.dedent("""
++    setting: from_yaml
++    use_ecg: true
++    use_ehr: true
++    fusion: gated
++    head: survival
++    d_model: 128
++    learning_rate: 0.0001
++    train_epochs: 30
++    lradj: cosine
++    made_up_key: 123
++""")
++
++
++@pytest.fixture()
++def cfg(tmp_path):
++    p = tmp_path / "cfg.yaml"
++    p.write_text(YAML)
++    return str(p)
++
++
++def test_yaml_fills_unset_keys(cfg):
++    a = resolve_args(["--config", cfg])
++    assert a.setting == "from_yaml"
++    assert a.train_epochs == 30
++    assert a.use_ehr is True
++
++
++def test_cli_beats_yaml_for_ablation_flags(cfg):
++    a = resolve_args(["--config", cfg, "--use_ehr", "0"])
++    assert a.use_ehr is False          # the ablation actually ablates
++    assert a.use_ecg is True           # untouched key still comes from YAML
++
++
++def test_cli_beats_yaml_for_setting_and_scalars(cfg):
++    a = resolve_args(["--config", cfg, "--setting", "ckd_2y_ecg_only",
++                      "--learning_rate", "1e-3", "--d_model", "64"])
++    assert a.setting == "ckd_2y_ecg_only"   # ablations keep separate checkpoint dirs
++    assert a.learning_rate == 1e-3
++    assert a.d_model == 64
++
++
++def test_cli_value_equal_to_default_is_still_respected(cfg):
++    # --head survival is also the parser default; passing it explicitly must not
++    # be mistaken for "unset" and then re-read from YAML.
++    a = resolve_args(["--config", cfg, "--head", "binary"])
++    assert a.head == "binary"
++    assert "head" in a.cli_overrides
++
++
++def test_yaml_values_are_type_coerced(cfg):
++    a = resolve_args(["--config", cfg])
++    assert isinstance(a.d_model, int)
++    assert isinstance(a.learning_rate, float)
++    assert isinstance(a.use_ecg, bool)
++
++
++def test_defaults_used_when_no_yaml():
++    a = resolve_args([])
++    assert a.setting == "ckd_run"
++    assert a.lradj == "cosine"          # not the legacy halve-every-epoch schedule
++
++
++def test_missing_config_raises():
++    with pytest.raises(FileNotFoundError):
++        resolve_args(["--config", "does/not/exist.yaml"])
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -0,0 +1,85 @@
++"""Metric regression tests: C-index equivalence, and censoring-aware td-AUROC."""
++
++import numpy as np
++
++from utils.metrics import (
++    concordance_index, horizon_eligibility, time_dependent_auroc,
++)
++
++
++def _naive_cindex(t, r, e):
++    """The original O(n^2) Python double loop, kept here as ground truth."""
++    t, r, e = np.asarray(t), np.asarray(r), np.asarray(e).astype(bool)
++    num = den = 0.0
++    for i in range(len(t)):
++        if not e[i]:
++            continue
++        for j in range(len(t)):
++            if t[j] > t[i]:
++                den += 1
++                if r[i] > r[j]:
++                    num += 1
++                elif r[i] == r[j]:
++                    num += 0.5
++    return num / den if den else float("nan")
++
++
++def test_vectorised_cindex_matches_naive_loop():
++    rng = np.random.default_rng(0)
++    for _ in range(5):
++        n = 200
++        t = rng.integers(1, 40, n).astype(float)   # ties in time
++        r = np.round(rng.random(n), 2)             # ties in risk
++        e = rng.random(n) > 0.7
++        got = concordance_index(t, r, e, use_lifelines=False)
++        assert abs(got - _naive_cindex(t, r, e)) < 1e-9
++
++
++def test_cindex_blocking_does_not_change_result():
++    rng = np.random.default_rng(1)
++    t, r, e = rng.random(500) * 100, rng.random(500), rng.random(500) > 0.5
++    a = concordance_index(t, r, e, use_lifelines=False, block=7)
++    b = concordance_index(t, r, e, use_lifelines=False, block=10_000)
++    assert abs(a - b) < 1e-9
++
++
++def test_cindex_perfect_and_inverted():
++    t = np.array([10.0, 20.0, 30.0, 40.0])
++    e = np.array([1, 1, 1, 0])
++    perfect = np.array([0.9, 0.8, 0.7, 0.6])   # higher risk -> earlier event
++    assert concordance_index(t, perfect, e, use_lifelines=False) == 1.0
++    assert concordance_index(t, -perfect, e, use_lifelines=False) == 0.0
++
++
++def test_cindex_nan_without_events():
++    t = np.arange(5.0)
++    assert np.isnan(concordance_index(t, np.random.rand(5), np.zeros(5), use_lifelines=False))
++
++
++def test_eligibility_excludes_early_censored():
++    horizon = 730.0
++    times = np.array([100.0, 300.0, 800.0, 730.0])
++    events = np.array([1, 0, 0, 0])           # #2 is censored at day 300 -> unknown label
++    elig = horizon_eligibility(times, events, horizon)
++    assert list(elig) == [True, False, True, True]
++
++
++def test_td_auroc_is_inflated_when_censored_counted_as_negative():
++    """Patients censored before the horizon have an unknown label. Scoring them
++    as negatives (eligible_mask=None) flatters the model -- that is the bug."""
++    horizon = 730.0
++    # 4 real positives, 4 followed-to-horizon negatives, 6 censored at day 50
++    times = np.array([100, 200, 300, 400] + [800] * 4 + [50] * 6, dtype=float)
++    events = np.array([1, 1, 1, 1] + [0] * 4 + [0] * 6)
++    labels = np.array([1, 1, 1, 1] + [0] * 4 + [0] * 6)
++    # the model separates the real positives from the real negatives only so-so,
++    # but gives the early-censored patients very low risk -- they pad the negative
++    # class with free wins the model was never actually tested on.
++    risk = np.array([0.9, 0.8, 0.45, 0.4] + [0.5] * 4 + [0.01] * 6)
++
++    elig = horizon_eligibility(times, events, horizon)
++    honest = time_dependent_auroc(risk, labels, eligible_mask=elig)
++    inflated = time_dependent_auroc(risk, labels, eligible_mask=None)
++    assert elig.sum() == 8
++    assert honest == 0.5          # the model is actually a coin flip here
++    assert inflated > honest      # ... but scores 0.8 if early-censored count as 0s
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -25,6 +25,7 @@
+     ehr_mode = "mlp"
+     ehr_dropout = 0.2
+     fusion = "gated"
++    cross_attn_tokens = "patches"
+     d_fuse = 64
+     head = "survival"
+     n_intervals = 8
+@@ -79,3 +80,46 @@
+     loss.backward()
+     grads = [p.grad is not None for p in model.parameters() if p.requires_grad]
+     assert any(grads)
++
++
++def test_backbone_returns_full_patch_token_sequence():
++    """encode(return_tokens=True) must hand back every patch token, not G pooled
++    summaries: T = sum_g ceil(seq_len / patch_len_g)."""
++    import math
++
++    from models.Cardioformer import Model as Backbone
++
++    cfg = Cfg()
++    backbone = Backbone(cfg)
++    x_ecg, _ = _batch()
++    feats, tokens = backbone.encode(x_ecg, return_tokens=True)
++
++    patch_lens = [int(p) for p in cfg.patch_len_list.split(",")]
++    expected_T = sum(math.ceil(cfg.seq_len / p) for p in patch_lens)
++    assert feats.shape == (4, len(patch_lens) * cfg.d_model)
++    assert tokens.shape == (4, expected_T, cfg.d_model)
++    assert tokens.shape[1] > len(patch_lens)   # not just the pooled summaries
++
++
++def test_cross_fusion_attends_over_patches_not_only_granularities():
++    import math
++
++    cfg = Cfg(); cfg.fusion = "cross"; cfg.cross_attn_tokens = "patches"
++    model = CardioformerCKD(cfg)
++    x_ecg, ehr = _batch()
++    out = model(x_ecg=x_ecg, ehr=ehr)
++    assert out.shape == (4, cfg.n_intervals)
++
++    patch_lens = [int(p) for p in cfg.patch_len_list.split(",")]
++    expected_T = sum(math.ceil(cfg.seq_len / p) for p in patch_lens)
++    # attention weights are (B, 1 query, T keys)
++    assert model.fuse.last_attn.shape == (4, 1, expected_T)
++
++
++def test_cross_fusion_granularity_mode_is_still_available():
++    cfg = Cfg(); cfg.fusion = "cross"; cfg.cross_attn_tokens = "granularity"
++    model = CardioformerCKD(cfg)
++    x_ecg, ehr = _batch()
++    out = model(x_ecg=x_ecg, ehr=ehr)
++    assert out.shape == (4, cfg.n_intervals)
++    assert model.fuse.last_attn.shape == (4, 1, model.n_gran)
+Binary files a/{} and b/{} differ
+Binary files a/{} and b/{} differ
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -5,7 +5,8 @@
+ AUROC at a chosen horizon bin, and a simple Brier-style calibration error).
+ 
+ scikit-learn is used where available; lightweight fallbacks are provided so the
+-core training loop never hard-fails on a metric.
++core training loop never hard-fails on a metric. ``lifelines`` is used for the
++C-index when installed, otherwise a vectorised numpy implementation is used.
+ """
+ 
+ import numpy as np
+@@ -18,6 +19,12 @@
+ except Exception:  # pragma: no cover
+     _HAS_SK = False
+ 
++try:  # optional, faster + independently validated
++    from lifelines.utils import concordance_index as _lifelines_cindex
++    _HAS_LIFELINES = True
++except Exception:  # pragma: no cover
++    _HAS_LIFELINES = False
++
+ 
+ def binary_metrics(y_true, y_prob, threshold=0.5):
+     y_true = np.asarray(y_true).ravel()
+@@ -40,37 +47,73 @@
+     return out
+ 
+ 
+-def concordance_index(event_times, predicted_risk, event_observed):
+-    """Harrell's C-index. Higher predicted_risk should mean earlier event.
++def concordance_index(event_times, predicted_risk, event_observed,
++                      use_lifelines=None, block=2048):
++    """Harrell's C-index. Higher ``predicted_risk`` should mean an earlier event.
++
++    Comparable pairs are (i, j) with i experiencing the event and t_j > t_i. A
++    pair is concordant if r_i > r_j and half-credited if r_i == r_j.
++
++    Implementation
++    --------------
++    Uses ``lifelines.utils.concordance_index`` when lifelines is installed (it
++    takes *risk* here, so the sign is flipped: lifelines expects a score where
++    higher == longer survival). Otherwise falls back to a blocked, vectorised
++    numpy computation -- same O(n^2) pair count, but done in numpy rather than a
++    Python double loop, and streamed in blocks of ``block`` rows so a large test
++    set does not allocate an n x n matrix.
+ 
+-    A pure-numpy O(n^2) implementation — fine for validation set sizes; swap for
+-    ``lifelines.utils.concordance_index`` on very large cohorts.
++    Set ``use_lifelines=False`` to force the numpy path (used by the tests).
+     """
+-    t = np.asarray(event_times).ravel()
+-    r = np.asarray(predicted_risk).ravel()
++    t = np.asarray(event_times, dtype=np.float64).ravel()
++    r = np.asarray(predicted_risk, dtype=np.float64).ravel()
+     e = np.asarray(event_observed).ravel().astype(bool)
+ 
++    if len(t) == 0 or not e.any():
++        return float("nan")
++
++    if use_lifelines is None:
++        use_lifelines = _HAS_LIFELINES
++    if use_lifelines and _HAS_LIFELINES:
++        try:
++            return float(_lifelines_cindex(t, -r, e.astype(int)))
++        except (ZeroDivisionError, ValueError):  # pragma: no cover
++            return float("nan")
++
+     num = den = 0.0
+-    n = len(t)
+-    for i in range(n):
+-        if not e[i]:
+-            continue
+-        for j in range(n):
+-            if t[j] > t[i]:
+-                den += 1
+-                if r[i] > r[j]:
+-                    num += 1
+-                elif r[i] == r[j]:
+-                    num += 0.5
++    idx_events = np.flatnonzero(e)
++    for s in range(0, idx_events.size, block):
++        i = idx_events[s:s + block]                 # (b,)
++        later = t[None, :] > t[i][:, None]          # (b, n) comparable pairs
++        den += float(later.sum())
++        ri = r[i][:, None]
++        num += float((later & (ri > r[None, :])).sum())
++        num += 0.5 * float((later & (ri == r[None, :])).sum())
+     return float(num / den) if den > 0 else float("nan")
+ 
+ 
++def horizon_eligibility(event_times, event_indicator, horizon_days):
++    """Who can be scored at a fixed horizon: had the event by then, or was
++    followed at least that far. Subjects censored *before* the horizon have an
++    unknown label and must be dropped -- counting them as negatives inflates the
++    time-dependent AUROC.
++
++    Mirrors ``eligible_binary`` in data_preprocessing/build_cohort.py; use that
++    column when it is available and this helper only as a fallback.
++    """
++    t = np.asarray(event_times, dtype=np.float64).ravel()
++    e = np.asarray(event_indicator).ravel().astype(bool)
++    return (e & (t <= horizon_days)) | (t >= horizon_days)
++
++
+ def time_dependent_auroc(cif_at_horizon, label_at_horizon, eligible_mask=None):
+     """AUROC of the cumulative incidence prediction at a fixed horizon bin.
+ 
+-    cif_at_horizon : (N,) predicted CIF = 1 - S(t_horizon)
++    cif_at_horizon   : (N,) predicted CIF = 1 - S(t_horizon)
+     label_at_horizon : (N,) 1 if event by horizon, else 0
+-    eligible_mask : optional (N,) bool, drop subjects censored before horizon
++    eligible_mask    : (N,) bool -- drop subjects censored before the horizon.
++                       Strongly recommended: without it, everyone censored early
++                       is scored as a negative and the metric is optimistic.
+     """
+     cif = np.asarray(cif_at_horizon).ravel()
+     lab = np.asarray(label_at_horizon).ravel()
+diff -ruN '--label=a/{}' '--label=b/{}' a/{} b/{}
+--- a/{}
++++ b/{}
+@@ -15,14 +15,42 @@
+ 
+ 
+ def adjust_learning_rate(optimizer, epoch, args):
+-    if getattr(args, "lradj", "type1") == "type1":
+-        lr = args.learning_rate * (0.5 ** ((epoch - 1) // 1))
+-    elif args.lradj == "cosine":
+-        lr = args.learning_rate / 2 * (1 + np.cos(np.pi * epoch / args.train_epochs))
++    """Set the LR for ``epoch`` (1-indexed) according to ``args.lradj``.
++
++    Schedules
++    ---------
++    cosine : lr * 0.5 * (1 + cos(pi * (epoch-1) / train_epochs))   [default]
++    step   : lr * lr_decay_rate ** ((epoch-1) // lr_decay_every)
++    type1  : lr * 0.5 ** (epoch-1)  -- legacy Time-Series-Library schedule. This
++             halves the LR *every* epoch, so by epoch 10 it is ~1e-3 of the
++             initial value and training has effectively stopped. Kept only so
++             older runs remain reproducible; do not use it for new experiments.
++    none   : constant LR.
++
++    Every schedule is floored at ``args.min_lr`` (default 1e-6).
++    """
++    base = args.learning_rate
++    mode = getattr(args, "lradj", "cosine")
++    min_lr = float(getattr(args, "min_lr", 1e-6))
++    total = max(int(getattr(args, "train_epochs", 1)), 1)
++
++    if mode in ("none", "const", "constant"):
++        return None
++    if mode == "cosine":
++        lr = base * 0.5 * (1 + np.cos(np.pi * min((epoch - 1) / total, 1.0)))
++    elif mode == "step":
++        every = max(int(getattr(args, "lr_decay_every", 5)), 1)
++        rate = float(getattr(args, "lr_decay_rate", 0.5))
++        lr = base * (rate ** ((epoch - 1) // every))
++    elif mode == "type1":
++        lr = base * (0.5 ** (epoch - 1))
+     else:
+-        return
++        return None
++
++    lr = max(lr, min_lr)
+     for pg in optimizer.param_groups:
+         pg["lr"] = lr
++    return lr
+ 
+ 
+ class EarlyStopping:

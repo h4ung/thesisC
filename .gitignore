@@ -1,0 +1,36 @@
+# data (NEVER commit credentialed PhysioNet data)
+dataset/
+data/
+*.npy
+*.parquet
+*.csv
+*.csv.gz
+*.dat
+*.hea
+
+# model artifacts
+checkpoints/
+results/
+*.pth
+*.ckpt
+wandb/
+runs/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

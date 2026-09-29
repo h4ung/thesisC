@@ -1,0 +1,47 @@
+# Experiment: 2-year incident-CKD RISK PREDICTION, multimodal, discrete-time survival.
+# Cohort built with: horizon_days=730, blank_days=30, n_intervals=8.
+
+task_name: ckd_prognosis
+setting: ckd_2y_survival_multimodal
+
+root_path: dataset/ckd
+data: MIMICIV_CKD
+seq_len: 250
+enc_in: 12
+
+d_model: 128
+n_heads: 8
+e_layers: 6
+d_ff: 256
+dropout: 0.1
+patch_len_list: "2,4,8,8,16,16,16,16,32,32,32,32"
+
+use_ecg: true
+use_ehr: true
+ehr_mode: mlp
+fusion: gated
+cross_attn_tokens: patches
+
+# prognostic risk layer (Thesis C) -- risk prediction, not binary classification
+head: survival              # survival | cox | binary (binary = ablation baseline only)
+head_hidden: 128
+n_intervals: 8
+horizon_days: 730           # must match build_cohort --horizon_days
+eval_horizons_days: "365,730"
+
+# risk stratification: cut-points fitted on validation, applied to test
+risk_strat_method: quantile # quantile | absolute | youden | sensitivity
+risk_strat_quantiles: "0.5" # median split -> low / high risk
+risk_strat_cutoffs: "0.05,0.15"
+
+# evaluation
+n_bootstrap: 200
+early_stop_metric: c_index
+
+batch_size: 16
+learning_rate: 0.0001
+train_epochs: 30
+patience: 6
+lradj: cosine
+min_lr: 0.000001
+seed: 41
