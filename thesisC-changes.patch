@@ -97,10 +97,10 @@ index f99a0b8..756b973 100644
  them as negatives inflates `td_auroc` (see `tests/test_metrics.py`).
 diff --git a/THESIS_C_CHANGES.md b/THESIS_C_CHANGES.md
 new file mode 100644
-index 0000000..fec0d94
+index 0000000..137b4fc
 --- /dev/null
 +++ b/THESIS_C_CHANGES.md
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,112 @@
 +# Thesis C changes
 +
 +Supervisor feedback at the start of Thesis C:
@@ -110,7 +110,7 @@ index 0000000..fec0d94
 +3. implement **ablation studies**.
 +
 +This file records what changed in the code for each point, plus one labelling
-+bug found along the way. Test status: **57 tests pass** (`pytest tests -q`),
++bug found along the way. Test status: **58 tests pass** (`pytest tests -q`),
 +including an end-to-end train → test → reload run on synthetic data and
 +cross-checks of the survival statistics against `lifelines`.
 +
@@ -195,6 +195,14 @@ index 0000000..fec0d94
 +  so the whole pipeline can be checked without MIMIC access. **Never report its numbers.**
 +* `tests/test_risk_layer.py`, `tests/test_ablation_and_e2e.py`: 24 new tests.
 +* Notebook sections 7–10 updated for stratification, ablations and per-patient risk.
++
++## 5. pandas 3 compatibility (CI fix)
++
++CI's Python 3.11 job installs pandas 3, whose copy-on-write makes `.to_numpy()`
++return read-only arrays; shuffling them in place raised `ValueError: array is
++read-only` in `data_preprocessing/make_splits.py` (and the synthetic generator).
++Both now shuffle a copy. `tests/test_ablation_and_e2e.py::test_make_splits_is_subject_independent_under_pandas3`
++guards it. Verified under pandas 2.3 and 3.0.
 +
 +## Behavioural changes
 +
@@ -499,6 +507,21 @@ index f66c12f..0817461 100644
  
  # optimisation
  batch_size: 16
+diff --git a/data_preprocessing/make_splits.py b/data_preprocessing/make_splits.py
+index cb2ad4f..f17656a 100644
+--- a/data_preprocessing/make_splits.py
++++ b/data_preprocessing/make_splits.py
+@@ -19,8 +19,8 @@ def run(args):
+ 
+     # subject-level label = 1 if any of the subject's studies is positive
+     subj = df.groupby("subject_id")["label_binary"].max().reset_index()
+-    pos = subj[subj["label_binary"] == 1]["subject_id"].to_numpy()
+-    neg = subj[subj["label_binary"] == 0]["subject_id"].to_numpy()
++    pos = subj[subj["label_binary"] == 1]["subject_id"].to_numpy().copy()  # pandas 3: read-only views
++    neg = subj[subj["label_binary"] == 0]["subject_id"].to_numpy().copy()
+     rng.shuffle(pos)
+     rng.shuffle(neg)
+ 
 diff --git a/data_provider/data_factory.py b/data_provider/data_factory.py
 index de433ce..9dc57be 100644
 --- a/data_provider/data_factory.py
@@ -2033,7 +2056,7 @@ index a96c10c..1510a7a 100644
 +python scripts/plot_results.py --ablation results/ckd_prognosis/ablation_summary.csv
 diff --git a/scripts/make_synthetic_dataset.py b/scripts/make_synthetic_dataset.py
 new file mode 100644
-index 0000000..e048cba
+index 0000000..b846886
 --- /dev/null
 +++ b/scripts/make_synthetic_dataset.py
 @@ -0,0 +1,112 @@
@@ -2121,7 +2144,7 @@ index 0000000..e048cba
 +    subj = df.groupby("subject_id")["label_binary"].max()
 +    split = {}
 +    for lab in (0, 1):
-+        ids = subj[subj == lab].index.to_numpy()
++        ids = subj[subj == lab].index.to_numpy().copy()  # pandas 3: to_numpy() can be read-only
 +        rng.shuffle(ids)
 +        n_tr, n_va = int(0.6 * len(ids)), int(0.2 * len(ids))
 +        split.update({i: "train" for i in ids[:n_tr]})
@@ -2298,10 +2321,10 @@ index 839ba94..5c4e606 100644
    --batch_size 16 --learning_rate 1e-4 --train_epochs 30 --patience 6
 diff --git a/tests/test_ablation_and_e2e.py b/tests/test_ablation_and_e2e.py
 new file mode 100644
-index 0000000..d4f076f
+index 0000000..9063a21
 --- /dev/null
 +++ b/tests/test_ablation_and_e2e.py
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,108 @@
 +"""Ablation plumbing + an end-to-end train/test run on synthetic data (CPU, ~10 s)."""
 +
 +import json
@@ -2390,6 +2413,26 @@ index 0000000..d4f076f
 +    main(argv + ["--is_training", "0"])
 +    m2 = json.load(open(out / "test_metrics.json"))
 +    assert m2["c_index"] == m["c_index"] and m2["td_auroc_730d"] == m["td_auroc_730d"]
++
++
++def test_make_splits_is_subject_independent_under_pandas3(tmp_path):
++    """pandas 3 copy-on-write makes .to_numpy() read-only; shuffling it in place
++    used to raise 'array is read-only' (CI failure on the 3.11 job)."""
++    import argparse
++
++    import pandas as pd
++
++    from data_preprocessing.make_splits import run
++    df = pd.DataFrame({"subject_id": [1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10],
++                       "study_id": range(12),
++                       "label_binary": [0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1]})
++    src = tmp_path / "ds.parquet"
++    df.to_parquet(src)
++    run(argparse.Namespace(dataset=str(src), out_dir=str(tmp_path), train_frac=0.6,
++                           val_frac=0.2, seed=41))
++    out = pd.read_parquet(tmp_path / "ckd_dataset_split.parquet")
++    assert out["split"].notna().all()
++    assert (out.groupby("subject_id")["split"].nunique() == 1).all()   # no subject leaks
 diff --git a/tests/test_risk_layer.py b/tests/test_risk_layer.py
 new file mode 100644
 index 0000000..a070bba

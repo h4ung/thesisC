@@ -154,17 +154,33 @@ def build_cohort(args):
 
     # ---- 4. eligibility / exclusions (incident, adult, baseline OK) -----
     n0 = len(cohort)
+    flow = []   # cohort flow for the report (Table 4.1): rows/subjects after each step
+
+    def log_step(name, df):
+        flow.append({"step": name, "ecg_studies": int(len(df)),
+                     "subjects": int(df["subject_id"].nunique())})
+
+    log_step("Candidate ECG studies", cohort)
     cohort = cohort[cohort["age_at_t0"] >= 18]
+    log_step("Age >= 18 at index ECG", cohort)
     cohort = cohort[~cohort["subject_id"].isin(esrd_subjects)]
+    log_step("No ESRD / dialysis / transplant", cohort)
     cohort = cohort[cohort["baseline_egfr"].notna() & (cohort["baseline_egfr"] >= 60)]
+    # require minimum prior history (baseline eGFR measured at/before t0)
+    have_hist = (cohort["t0"] - cohort["baseline_egfr_time"]).dt.days >= 0
+    cohort = cohort[have_hist]
+    log_step("Baseline eGFR >= 60 in lookback", cohort)
     # exclude prevalent CKD: onset at or before t0 (+ small grace via blanking)
     prevalent = cohort["ckd_onset_time"].notna() & (
         cohort["ckd_onset_time"] <= cohort["t0"] + pd.to_timedelta(args.blank_days, "D")
     )
     cohort = cohort[~prevalent]
-    # require minimum prior history
-    have_hist = (cohort["t0"] - cohort["baseline_egfr_time"]).dt.days >= 0
-    cohort = cohort[have_hist]
+    log_step(f"No prevalent CKD by t0 + {args.blank_days} d", cohort)
+    flow_df = pd.DataFrame(flow)
+    flow_df["removed_studies"] = (-flow_df["ecg_studies"].diff()).fillna(0).astype(int)
+    flow_df.to_csv(os.path.join(args.out_dir, "cohort_flow.csv"), index=False)
+    print("[cohort] flow (Table 4.1):")
+    print(flow_df.to_string(index=False))
     print(f"[cohort] {n0} candidate studies -> {len(cohort)} eligible after exclusions")
 
     # ---- 5. labels, event time, censoring, binning ----------------------

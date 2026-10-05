@@ -19,8 +19,8 @@ def run(args):
 
     # subject-level label = 1 if any of the subject's studies is positive
     subj = df.groupby("subject_id")["label_binary"].max().reset_index()
-    pos = subj[subj["label_binary"] == 1]["subject_id"].to_numpy()
-    neg = subj[subj["label_binary"] == 0]["subject_id"].to_numpy()
+    pos = subj[subj["label_binary"] == 1]["subject_id"].to_numpy().copy()  # pandas 3: read-only views
+    neg = subj[subj["label_binary"] == 0]["subject_id"].to_numpy().copy()
     rng.shuffle(pos)
     rng.shuffle(neg)
 

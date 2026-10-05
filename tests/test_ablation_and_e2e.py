@@ -86,3 +86,23 @@ def test_end_to_end_train_test_writes_risk_outputs(tmp_path, head):
     main(argv + ["--is_training", "0"])
     m2 = json.load(open(out / "test_metrics.json"))
     assert m2["c_index"] == m["c_index"] and m2["td_auroc_730d"] == m["td_auroc_730d"]
+
+
+def test_make_splits_is_subject_independent_under_pandas3(tmp_path):
+    """pandas 3 copy-on-write makes .to_numpy() read-only; shuffling it in place
+    used to raise 'array is read-only' (CI failure on the 3.11 job)."""
+    import argparse
+
+    import pandas as pd
+
+    from data_preprocessing.make_splits import run
+    df = pd.DataFrame({"subject_id": [1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10],
+                       "study_id": range(12),
+                       "label_binary": [0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1]})
+    src = tmp_path / "ds.parquet"
+    df.to_parquet(src)
+    run(argparse.Namespace(dataset=str(src), out_dir=str(tmp_path), train_frac=0.6,
+                           val_frac=0.2, seed=41))
+    out = pd.read_parquet(tmp_path / "ckd_dataset_split.parquet")
+    assert out["split"].notna().all()
+    assert (out.groupby("subject_id")["split"].nunique() == 1).all()   # no subject leaks

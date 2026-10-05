@@ -7,7 +7,7 @@ Supervisor feedback at the start of Thesis C:
 3. implement **ablation studies**.
 
 This file records what changed in the code for each point, plus one labelling
-bug found along the way. Test status: **57 tests pass** (`pytest tests -q`),
+bug found along the way. Test status: **58 tests pass** (`pytest tests -q`),
 including an end-to-end train → test → reload run on synthetic data and
 cross-checks of the survival statistics against `lifelines`.
 
@@ -93,6 +93,14 @@ draws the Δ C-index chart.
 * `tests/test_risk_layer.py`, `tests/test_ablation_and_e2e.py`: 24 new tests.
 * Notebook sections 7–10 updated for stratification, ablations and per-patient risk.
 
+## 5. pandas 3 compatibility (CI fix)
+
+CI's Python 3.11 job installs pandas 3, whose copy-on-write makes `.to_numpy()`
+return read-only arrays; shuffling them in place raised `ValueError: array is
+read-only` in `data_preprocessing/make_splits.py` (and the synthetic generator).
+Both now shuffle a copy. `tests/test_ablation_and_e2e.py::test_make_splits_is_subject_independent_under_pandas3`
+guards it. Verified under pandas 2.3 and 3.0.
+
 ## Behavioural changes
 
 | change | effect |
@@ -102,3 +110,17 @@ draws the Δ C-index chart.
 | `brier_at_horizon` now IPCW-weighted over all patients | differs from Thesis B's unweighted eligible-only value |
 | early stopping on `--early_stop_metric` (default C-index) for every head | binary head previously early-stopped on AUROC |
 | `test()` writes predictions / groups / curves | extra files in each results dir |
+
+## 6. Preprocessing speed and cohort reporting (6 Oct)
+
+* `extract_ehr_features.py` rewritten for speed: the old loop rebuilt the
+  patients index twice per ECG study and ran ~20 pandas filters per study
+  (many hours on the full cohort, no progress output). Labs are now sorted
+  once per subject and windowed by binary search; a progress line with an
+  ETA is printed. Output is identical to the old version
+  (`tests/test_ehr_features_fast.py` compares them value by value).
+* `build_cohort.py` now records the ECG-study and subject counts after each
+  exclusion step in `dataset/ckd/cohort_flow.csv` (Table 4.1). Final cohort
+  is unchanged.
+* `scripts/cohort_table.py` prints Table 4.1 and the Table 4.2 numbers.
+* `scripts/filter_labevents.py` shrinks labevents to the 8 lab tests used.

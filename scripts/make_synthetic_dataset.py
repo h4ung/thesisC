@@ -82,7 +82,7 @@ def make(out_dir, n_subjects=600, studies_per_subject=(1, 3), horizon=730.0,
     subj = df.groupby("subject_id")["label_binary"].max()
     split = {}
     for lab in (0, 1):
-        ids = subj[subj == lab].index.to_numpy()
+        ids = subj[subj == lab].index.to_numpy().copy()  # pandas 3: to_numpy() can be read-only
         rng.shuffle(ids)
         n_tr, n_va = int(0.6 * len(ids)), int(0.2 * len(ids))
         split.update({i: "train" for i in ids[:n_tr]})
