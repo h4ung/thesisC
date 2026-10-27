@@ -4,7 +4,9 @@ Multimodal **prognostic risk-prediction** model that estimates each patient's
 **risk of developing incident chronic kidney disease (CKD)** over a future
 horizon (1 and 2 years), and stratifies patients into **low- and high-risk
 groups**, by combining the **MIMIC-IV** electronic health record (EHR) with the
-**MIMIC-IV-ECG** 12-lead waveform dataset.
+**MIMIC-IV-ECG** 12-lead waveform dataset. Whether the ECG adds valuable prognostic
+information about future CKD, beyond what the EHR already provides, is the main motivation
+driving this thesis.
 
 ## Quick start
 
