@@ -60,7 +60,7 @@ def collect(plan_path, forwarded=()):
             f = os.path.join(out, "test_metrics.json")
             if not os.path.exists(f):
                 continue
-            m = json.load(open(f))
+            m = json.load(open(f, encoding="utf-8"))
             runs[(v, s)] = m
             rows.append(dict({"variant": v, "seed": s},
                              **{k: m.get(k, float("nan")) for k in metrics}))
@@ -93,7 +93,7 @@ def write_tables(plan, rows, summary, out_dir):
 
     for name, data in (("ablation_runs.csv", rows), ("ablation_summary.csv", summary)):
         if data:
-            with open(os.path.join(out_dir, name), "w", newline="") as f:
+            with open(os.path.join(out_dir, name), "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=list(data[0].keys()))
                 w.writeheader()
                 w.writerows(data)
@@ -122,12 +122,18 @@ def write_tables(plan, rows, summary, out_dir):
         md.append("")
         tex += ["\\bottomrule", "\\end{tabular}",
                 f"\\caption{{Ablation: {g.replace('_', ' ')}.}}", "\\end{table}", ""]
-    open(os.path.join(out_dir, "ablation_summary.md"), "w").write("\n".join(md))
-    open(os.path.join(out_dir, "ablation_summary.tex"), "w").write("\n".join(tex))
+    open(os.path.join(out_dir, "ablation_summary.md"), "w", encoding="utf-8").write("\n".join(md))
+    open(os.path.join(out_dir, "ablation_summary.tex"), "w", encoding="utf-8").write("\n".join(tex))
     return os.path.join(out_dir, "ablation_summary.md")
 
 
 def main(argv=None):
+    # Windows consoles default to cp1252, which cannot print "Δ"/"±"
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     p = argparse.ArgumentParser(description="Collect ablation results")
     p.add_argument("--plan", default="configs/ablations.yaml")
     p.add_argument("--out_dir", default=None, help="default: the results root")
@@ -142,7 +148,7 @@ def main(argv=None):
         print("[collect] no finished runs found")
         return 1
     path = write_tables(plan, rows, summary, args.out_dir or res_root)
-    print(open(path).read())
+    print(open(path, encoding="utf-8").read())
     print(f"[collect] {len(rows)} runs -> {os.path.dirname(path)}")
     return 0
 
