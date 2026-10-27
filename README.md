@@ -24,6 +24,14 @@ python run_ablations.py --plan configs/ablations.yaml
 python collect_results.py --plan configs/ablations.yaml
 ```
 
+## Provenance of the ECG backbone (important for the thesis)
+
+`models/Cardioformer.py`, `layers/Embed.py` and `layers/Cardioformer_EncDec.py`
+are an re-implementation of the Cardioformer encoder,
+written from the description in the paper (Mobin et al.,
+*Cardioformer: Advancing AI in ECG Analysis with Multi-Granularity Patching and
+ResNet*, [arXiv:2505.05538](https://arxiv.org/abs/2505.05538), 2025).
+
 ## What the model outputs (per patient)
 
 | output | meaning |
