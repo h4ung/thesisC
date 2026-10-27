@@ -1,4 +1,4 @@
-# Cardioformer-CKD: Multimodal Risk Prediction for Incident Chronic Kidney Disease
+# Multimodal Risk Prediction for Incident Chronic Kidney Disease
 
 Multimodal **prognostic risk-prediction** model that estimates each patient's
 **risk of developing incident chronic kidney disease (CKD)** over a future
